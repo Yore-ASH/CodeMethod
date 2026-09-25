@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codemethod"
+version = "1.0.0"
+description = "多标签代码实现规划与知识库 — 记录、标注、多语言实现、全量历史回滚的 PySide6 桌面工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "CodeMethod" }]
+keywords = ["snippets", "pyside6", "qt", "syntax-highlighting", "versioning", "knowledge-base", "multi-label"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Editors",
+]
+
+# 运行期唯一依赖: PySide6 (含 QtCore/QtGui/QtWidgets)
+dependencies = ["PySide6>=6.5"]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+dev = ["pytest>=7.0", "pyinstaller>=6.0"]
+
+[project.gui-scripts]
+# 安装后可直接运行 `codemethod`
+codemethod = "codemethod.app:main"
+
+[project.scripts]
+codemethod-cli = "codemethod.app:main"
+
+[project.urls]
+Homepage = "https://example.invalid/codemethod"
+Documentation = "https://example.invalid/codemethod/docs"
+
+[tool.setuptools]
+packages = [
+    "codemethod",
+    "codemethod.core",
+    "codemethod.storage",
+    "codemethod.ui",
+    "codemethod.ui.widgets",
+    "codemethod.ui.dialogs",
+]
+include-package-data = true
+
+[tool.setuptools.package-data]
+codemethod = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["E501", "N802", "N803", "N806"]

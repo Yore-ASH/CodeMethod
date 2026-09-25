@@ -1,0 +1,29 @@
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+build_assets/*.ico
+
+# 开发期临时文件
+_shots/
+_scratch_*.py
+_*.py
+*.cmdb.tmp-*
+*.cmj.tmp-*
+
+# 用户数据 (示例)
+*.cmdb.[0-9]
