@@ -16,7 +16,9 @@ env/
 build/
 dist/
 *.egg-info/
+# 图标与版本资源都由 build.py 从源码现算, 不入库
 build_assets/*.ico
+build_assets/version_info.txt
 
 # 开发期临时文件
 _shots/

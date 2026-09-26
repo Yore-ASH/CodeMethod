@@ -110,6 +110,11 @@ icon_path = os.path.join("build_assets", "codemethod.ico")
 if not os.path.exists(icon_path):
     icon_path = None
 
+# Windows 版本资源 (由 build.py 生成): 决定"属性 → 详细信息"里显示的内容
+version_path = os.path.join("build_assets", "version_info.txt")
+if not os.path.exists(version_path):
+    version_path = None
+
 if ONEDIR:
     exe = EXE(
         pyz,
@@ -128,6 +133,7 @@ if ONEDIR:
         codesign_identity=None,
         entitlements_file=None,
         icon=icon_path,
+        version=version_path,
     )
     coll = COLLECT(
         exe,
@@ -161,4 +167,5 @@ else:
         codesign_identity=None,
         entitlements_file=None,
         icon=icon_path,
+        version=version_path,
     )

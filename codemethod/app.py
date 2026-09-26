@@ -288,7 +288,164 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--demo", action="store_true", help="启动时载入示例库")
     parser.add_argument("--theme", choices=["dark+", "light"], default="dark+", help="界面主题")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
+    parser.add_argument(
+        "--selftest",
+        metavar="REPORT",
+        help="不启动界面, 跑一遍自检 (容器读写/导出/高亮/界面构建) 并把报告写到指定文件; "
+        "主要用于验证 PyInstaller 打包后的程序是否完整",
+    )
     return parser
+
+
+def run_self_test(report_path: Optional[str] = None) -> int:
+    """无界面自检: 覆盖打包后最容易出问题的地方。
+
+    检查项: 依赖导入、语言注册表、容器读写与校验、三种导出、语法高亮、界面构建。
+    返回 0 表示全部通过。报告同时写到 ``report_path`` (若有) 与标准输出。
+    """
+    import tempfile
+
+    from .core.languages import all_languages
+    from .storage import exporter
+    from .storage.container import verify_file
+    from .ui.highlighter import highlighted_tokens
+
+    lines: List[str] = []
+    failures: List[str] = []
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        lines.append(f"[{'PASS' if condition else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+        if not condition:
+            failures.append(name)
+
+    lines.append(f"{APP_NAME} {APP_VERSION} 自检")
+    lines.append(f"Python {sys.version.split()[0]} · frozen={getattr(sys, 'frozen', False)}")
+    lines.append(f"可执行文件: {sys.executable}")
+    lines.append("")
+
+    # 1) 语言注册表
+    languages = list(all_languages())
+    check("语言注册表", len(languages) >= 20, f"{len(languages)} 种语言")
+    for required in ("c", "cpp", "go", "java", "python", "php", "rust"):
+        check(f"必需语言 {required}", any(spec.id == required for spec in languages))
+
+    # 2) 语法高亮 (每种语言都能产出 token)
+    for spec in languages:
+        tokens = highlighted_tokens(spec.id, "int main() { return 0; } // x\n")
+        check(f"高亮 {spec.name}", len(tokens) > 0, f"{len(tokens)} 个片段")
+
+    # 3) 容器读写 + 校验 + 导出
+    with tempfile.TemporaryDirectory(prefix="codemethod-selftest-") as tmp:
+        repo = build_demo_repository()
+        database = Database(repo)
+
+        binary_path = os.path.join(tmp, "selftest.cmdb")
+        text_path = os.path.join(tmp, "selftest.cmj")
+        result_bin = database.save(binary_path)
+        result_txt = database.save(text_path, binary=False, backup=False)
+        check("保存二进制容器", os.path.exists(binary_path), result_bin.describe())
+        check("保存文本容器", os.path.exists(text_path), result_txt.describe())
+
+        ok_bin, problems_bin, _ = verify_file(binary_path)
+        check("二进制容器完整性", ok_bin, "; ".join(problems_bin) or "CRC32/SHA-256 一致")
+        ok_txt, problems_txt, _ = verify_file(text_path)
+        check("文本容器完整性", ok_txt, "; ".join(problems_txt) or "integrity 一致")
+
+        reopened = Database.open(binary_path)
+        check(
+            "重新打开并比对条目数",
+            len(reopened.repository.entries) == len(repo.entries),
+            f"{len(reopened.repository.entries)} 个条目",
+        )
+        check(
+            "修订历史完整",
+            reopened.repository.history.total_count() == repo.history.total_count(),
+            f"{reopened.repository.history.total_count()} 条修订",
+        )
+
+        md = os.path.join(tmp, "lib.md")
+        js = os.path.join(tmp, "lib.json")
+        zp = os.path.join(tmp, "lib.zip")
+        exporter.export_markdown(repo, md)
+        exporter.export_json(repo, js)
+        exporter.export_zip(repo, zp)
+        check("导出 Markdown", os.path.getsize(md) > 0, f"{os.path.getsize(md)} 字节")
+        check("导出 JSON", os.path.getsize(js) > 0, f"{os.path.getsize(js)} 字节")
+        check("导出 ZIP", os.path.getsize(zp) > 0, f"{os.path.getsize(zp)} 字节")
+        check(
+            "ZIP 回读",
+            len(exporter.read_zip_export(zp)["entries"]) == len(repo.entries),
+        )
+
+        # 4) 界面构建 (offscreen, 覆盖 Qt 插件是否被正确打包)
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app, DEFAULT_THEME)
+        window = MainWindow(Database(build_demo_repository()))
+        # 把窗口的 QSettings 指到临时目录: 自检不应污染用户的真实配置
+        window.settings = QSettings(os.path.join(tmp, "selftest.ini"), QSettings.Format.IniFormat)
+        window.resize(1280, 800)
+        window.show()
+        for _ in range(4):
+            app.processEvents()
+        rows = window.entry_list.entry_model.rowCount()
+        check("主窗口构建", rows == 4, f"列表 {rows} 行")
+
+        # 选中一个"有多种语言实现"的条目, 顺带验证多语言页签在打包产物里也正常
+        target = next(
+            (e for e in window.db.repository.entries_list() if len(e.active_implementations) > 1),
+            None,
+        )
+        if target is None:
+            check("存在多语言实现条目", False, "示例库里找不到")
+        else:
+            window.entry_list.select_entry(target.id)
+            window.refresh_detail()
+            for _ in range(3):
+                app.processEvents()
+            expected_tabs = 1 + len(target.active_implementations)
+            shown = window.detail_panel.current_entry()
+            check(
+                "选中条目后详情跟随",
+                shown is not None and shown.id == target.id,
+                shown.display_title if shown else "空",
+            )
+            check(
+                "每个语言一个页签",
+                window.detail_panel.tabs.count() == expected_tabs,
+                f"{window.detail_panel.tabs.count()} 个页签 / 期望 {expected_tabs}",
+            )
+            check(
+                "语法高亮已挂载",
+                len(window.detail_panel._previews) == len(target.active_implementations),
+                f"{len(window.detail_panel._previews)} 个代码视图",
+            )
+
+        # 标记为已保存, 否则 close() 会弹出"是否保存"的模态框把自检卡死
+        window.db.repository.mark_clean()
+        window.close()
+        for _ in range(3):
+            app.processEvents()
+        # 显式销毁, 这样自检也可以在单元测试里被反复调用而不会残留窗口
+        window.deleteLater()
+        for _ in range(3):
+            app.processEvents()
+
+    lines.append("")
+    lines.append(f"结果: {'全部通过' if not failures else '失败 ' + str(len(failures)) + ' 项: ' + ', '.join(failures)}")
+    report = "\n".join(lines)
+
+    if report_path:
+        try:
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write(report + "\n")
+        except OSError as exc:  # pragma: no cover - 防御
+            print(f"无法写入报告 {report_path}: {exc}", file=sys.stderr)
+    print(report)
+    return 0 if not failures else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -297,6 +454,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 允许在无显示器环境 (CI / 容器) 下运行界面代码
     if os.environ.get("CODEMETHOD_OFFSCREEN"):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    if args.selftest is not None:
+        # 自检完全离屏运行, 用于验证打包产物 (CI 或人工确认)
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        report = None if args.selftest in ("", "-") else args.selftest
+        return run_self_test(report)
 
     from PySide6.QtWidgets import QApplication
 

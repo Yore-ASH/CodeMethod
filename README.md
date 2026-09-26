@@ -419,25 +419,59 @@ codemethod --demo          # 安装后可直接运行
 ### 构建独立可执行文件
 
 ```powershell
-.\build.ps1                # 单文件 dist\CodeMethod.exe
-.\build.ps1 -OneDir        # 目录模式, 启动更快
-.\build.ps1 -Tests -Clean  # 先跑测试并清理旧产物
+.\build.ps1                    # 单文件 dist\CodeMethod.exe
+.\build.ps1 -OneDir            # 目录版 dist\CodeMethod\ (启动更快)
+.\build.ps1 -All -Zip          # 两种都构建, 并额外产出分发包 zip
+.\build.ps1 -Tests -Clean      # 先跑 191 个测试并清理旧产物
 ```
 
 或者直接用 Python / 批处理:
 
 ```bash
-python build.py            # 等价
-build.bat --onedir         # Windows 批处理
-pyinstaller codemethod.spec --noconfirm   # 直接调用 PyInstaller
+python build.py --all --zip --tests    # 等价, 推荐用于正式发版
+build.bat --onedir                     # Windows 批处理
+pyinstaller codemethod.spec --noconfirm   # 直接调用 PyInstaller (需先有图标与版本资源)
 ```
 
-`build.py` 会自动: 生成多尺寸 `.ico` 图标 (由程序内绘制的图标导出, 仓库里不需要放图片)、
-按需安装 PyInstaller、调用 spec 打包。spec 里主动排除了 WebEngine / 3D / Multimedia /
-Quick 等用不到的 Qt 模块, 显著缩小体积。
+`build.py` 会自动完成:
 
-程序**不依赖任何外部数据文件**: 图标是运行时用 `QPainter` 画出来的, 因此打包后是纯
-单文件, 不会出现"资源路径找不到"的问题。
+1. 从 `codemethod/ui/resources.py` 里用 `QPainter` 画出的图标导出**多尺寸 `.ico`**
+   (仓库里不需要放任何图片);
+2. 生成 Windows **版本资源** (决定"属性 → 详细信息"里的产品名/版本号/版权);
+3. 按需 `pip install pyinstaller`, 然后调用 `codemethod.spec` 打包;
+4. **对产物执行内置自检** `CodeMethod.exe --selftest`, 不通过就让整个构建返回非零;
+5. 按需把目录版压成分发 zip, 并打印每个发行物的大小与 SHA-256。
+
+### 发行物
+
+| 路径 | 说明 |
+| --- | --- |
+| `dist/CodeMethod.exe` | **单文件绿色版**, 约 45 MB, 拷走即可运行, 无需安装 |
+| `dist/CodeMethod/` | 目录版, 启动更快 (免去每次解压临时目录) |
+| `dist/CodeMethod-<版本>-win64.zip` | 目录版的压缩包, 可直接分发给别人 |
+
+spec 里主动排除了 WebEngine / 3D / Multimedia / Quick 等用不到的 Qt 模块, 把体积从
+~250 MB 压到 ~45 MB。程序**不依赖任何外部数据文件** (图标是运行时画出来的),
+因此不会出现"资源路径找不到"的问题。
+
+### 验证打包产物 (`--selftest`)
+
+打包最容易出的问题是"能编译但跑不起来"(缺 Qt 插件、少 hiddenimport)。为此程序内置了
+一个无界面自检模式:
+
+```powershell
+dist\CodeMethod.exe --selftest report.txt
+```
+
+它会在离屏模式下跑完 40+ 项检查并写报告:
+
+- 22 种语言注册表与**每种语言的语法高亮**都能产出 token;
+- `.cmdb` / `.cmj` 容器的**写入、读回、完整性校验**(CRC32 / SHA-256);
+- Markdown / JSON / ZIP 三种导出与 ZIP 回读;
+- 主窗口构建、条目列表、**多语言页签**、代码视图挂载 (覆盖 Qt 平台插件是否被正确打包)。
+
+全部通过时退出码为 `0`。`build.py` 在每次构建后都会自动调用它, 所以"构建成功"
+本身就意味着"产物自检通过"。CI 里也可以直接对产物调用来做冒烟测试。
 
 ---
 

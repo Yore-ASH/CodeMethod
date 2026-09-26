@@ -677,5 +677,44 @@ def tearDownModule() -> None:
             app.processEvents()
 
 
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestSelfTest(_TrackedWidgets):
+    """``--selftest`` 是打包产物的验证入口, 它自己坏了就等于没有验证。"""
+
+    def test_selftest_passes_and_writes_report(self):
+        import contextlib
+        import io
+        import tempfile
+
+        from codemethod.app import run_self_test
+
+        report = os.path.join(tempfile.mkdtemp(prefix="codemethod-selftest-"), "report.txt")
+        with contextlib.redirect_stdout(io.StringIO()):  # 自检会打印完整报告, 测试里静音
+            code = run_self_test(report)
+
+        self.assertEqual(code, 0, "自检未通过")
+        self.assertTrue(os.path.exists(report), "自检没有写出报告")
+        with open(report, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("自检", text)
+        self.assertNotIn("[FAIL]", text)
+        self.assertIn("全部通过", text)
+        # 自检覆盖了关键路径
+        for needle in ("语言注册表", "二进制容器完整性", "导出 ZIP", "主窗口构建", "每个语言一个页签"):
+            self.assertIn(needle, text, f"自检缺少检查项: {needle}")
+
+    def test_selftest_does_not_leak_windows(self):
+        import contextlib
+        import io
+
+        from codemethod.app import run_self_test
+
+        for _ in range(2):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run_self_test(None), 0)
+        # 能跑到这里且进程没崩, 就说明窗口被正确销毁了
+        self.app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()
