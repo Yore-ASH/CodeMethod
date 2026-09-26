@@ -145,6 +145,28 @@ if ONEDIR:
         upx_exclude=[],
         name="CodeMethod",
     )
+
+    # ------------------------------------------------------------------------------
+    # 删掉工作目录里的"半成品" exe。
+    #
+    # 目录模式下 PyInstaller 会先在 build/codemethod/ 生成一个引导程序 exe, 再由
+    # COLLECT 把依赖复制到 dist/CodeMethod/_internal/。那个中间 exe 旁边**没有**
+    # _internal, 一旦被人当成成品双击, 就会弹:
+    #     Failed to load Python DLL '...\build\codemethod\_internal\python3xx.dll'
+    # 并且它长得和真成品一样 (同名同图标), 极易误点, 所以构建完成后直接删除。
+    # 增量重建不受影响: PyInstaller 发现 exe 缺失会自动重新生成。
+    # ------------------------------------------------------------------------------
+    _work = globals().get("WORKPATH") or os.path.join(SPECPATH, "build")
+    for _candidate in (
+        os.path.join(_work, "CodeMethod.exe"),
+        os.path.join(SPECPATH, "build", "codemethod", "CodeMethod.exe"),
+    ):
+        if os.path.exists(_candidate):
+            try:
+                os.remove(_candidate)
+                print(f"[spec] 已移除中间产物: {_candidate}")
+            except OSError as _exc:  # pragma: no cover - 防御
+                print(f"[spec] 无法移除中间产物 {_candidate}: {_exc}")
 else:
     exe = EXE(
         pyz,

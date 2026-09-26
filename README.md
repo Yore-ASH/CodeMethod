@@ -473,6 +473,35 @@ dist\CodeMethod.exe --selftest report.txt
 全部通过时退出码为 `0`。`build.py` 在每次构建后都会自动调用它, 所以"构建成功"
 本身就意味着"产物自检通过"。CI 里也可以直接对产物调用来做冒烟测试。
 
+### 打包常见问题
+
+**`Failed to load Python DLL '...\build\codemethod\_internal\python3xx.dll'`**
+
+说明你运行的是 PyInstaller 在 `build\codemethod\` 里的**中间产物** —— 那是引导程序
+半成品, 旁边没有 `_internal\`, 跑不起来。它与真成品同名同图标, 极易误点。
+
+- 请改运行 `dist\` 下的产物 (见上面的发行物表);
+- 现在 `codemethod.spec` 会在构建完成后**自动删除**这个中间 exe, `build.py` 也会再兜底
+  检查一次并把问题当成构建失败, 因此正常构建不会再有这个文件;
+- `build\README.txt` 里也会写明这一点。
+
+**目录版移动后报同样的错**
+
+目录版依赖同级的 `_internal\` 文件夹, 必须**整个 `CodeMethod\` 文件夹一起拷贝**,
+只拷 `CodeMethod.exe` 会找不到 Python DLL 与 Qt 插件。
+只想拿单个文件就用单文件版 `dist\CodeMethod.exe`。
+
+**单文件版启动慢 / 被安全软件拦截**
+
+单文件版每次启动都会把内容解压到 `%TEMP%`, 因此首启比目录版慢几秒;
+若安全软件限制临时目录写入, 请改用目录版。
+
+**产物启动后没有窗口**
+
+先跑 `dist\CodeMethod.exe --selftest report.txt` 看报告定位问题;
+如果自检通过但界面不出来, 通常是显卡/远程桌面下的 Qt 渲染问题, 可设
+`QT_OPENGL=software` 或 `QT_QPA_PLATFORM=windows` 再试。
+
 ---
 
 ## 测试

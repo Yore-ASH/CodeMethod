@@ -33,6 +33,10 @@ ICO = os.path.join(ASSETS, "codemethod.ico")
 VERSION_FILE = os.path.join(ASSETS, "version_info.txt")
 SPEC = os.path.join(ROOT, "codemethod.spec")
 DIST = os.path.join(ROOT, "dist")
+# 目录模式下 PyInstaller 的中间产物: 旁边没有 _internal, 双击会报
+# "Failed to load Python DLL ...\build\codemethod\_internal\python3xx.dll"
+STAGING_EXE = os.path.join(ROOT, "build", "codemethod", "CodeMethod.exe")
+BUILD_README = os.path.join(ROOT, "build", "README.txt")
 
 # Windows 控制台默认可能是 GBK, 中文/符号会直接抛 UnicodeEncodeError, 这里统一成 UTF-8。
 for _stream in (sys.stdout, sys.stderr):
@@ -243,6 +247,74 @@ def report_artifact(path: str) -> None:
     print(f"   {os.path.relpath(path, ROOT):<42} {human_size(size):>10}  sha256 {sha256_of(path)[:16]}…")
 
 
+def remove_staging_exe() -> bool:
+    """删除目录模式的中间产物 exe (spec 里已删一次, 这里兜底)。
+
+    那个 exe 与真正的成品同名同图标, 但旁边没有 ``_internal``, 用户误点会看到
+    ``Failed to load Python DLL`` —— 留着它只有坏处。
+    """
+    if not os.path.exists(STAGING_EXE):
+        return True
+    try:
+        os.remove(STAGING_EXE)
+        print("   已移除中间产物:", os.path.relpath(STAGING_EXE, ROOT))
+        return True
+    except OSError as exc:
+        print(f"   无法移除中间产物 {STAGING_EXE}: {exc}", file=sys.stderr)
+        return False
+
+
+def write_build_readme(version: str) -> None:
+    """在 build/ 放一个说明, 防止有人把中间产物当成发行物。"""
+    try:
+        os.makedirs(os.path.dirname(BUILD_README), exist_ok=True)
+        with open(BUILD_README, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"""这里是 PyInstaller 的中间构建目录 — 不要运行这里的任何 exe
+============================================================
+
+本目录里的 CodeMethod.exe (如果存在) 是**引导程序半成品**:
+它旁边没有 _internal\\, 直接双击会报
+
+    Failed to load Python DLL '...\\build\\codemethod\\_internal\\python3xx.dll'
+
+真正的发行物在 dist\\ 下, 请运行:
+
+    dist\\CodeMethod.exe                    单文件绿色版 (推荐, 拷走即用)
+    dist\\CodeMethod\\CodeMethod.exe         目录版 (整个 CodeMethod\\ 文件夹一起拷贝)
+    dist\\CodeMethod-{version}-win64.zip     目录版的压缩包
+
+注意: 目录版必须连同同级的 _internal\\ 文件夹一起移动, 只拷 exe 会报同样的错。
+想只拿一个文件, 用单文件版 dist\\CodeMethod.exe。
+
+本目录可以随时删除; 重新构建时会自动生成。
+"""
+            )
+    except OSError:  # pragma: no cover - 防御
+        pass
+
+
+def verify_layout(built: list) -> list:
+    """检查发行物布局, 返回问题列表 (空列表 = 没问题)。"""
+    problems: list = []
+    for path in built:
+        if not os.path.exists(path):
+            problems.append(f"缺少产物: {path}")
+            continue
+        # 目录版必须自带 _internal, 否则运行时找不到 python3xx.dll / Qt 插件
+        if os.path.basename(os.path.dirname(path)) == "CodeMethod":
+            internal = os.path.join(os.path.dirname(path), "_internal")
+            if not os.path.isdir(internal):
+                problems.append(f"目录版缺少 _internal 目录: {internal}")
+            else:
+                dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+                if not os.path.exists(os.path.join(internal, dll)):
+                    problems.append(f"目录版 _internal 里没有 {dll}")
+    if os.path.exists(STAGING_EXE):
+        problems.append(f"build/ 下仍残留中间产物 exe (极易被误运行): {STAGING_EXE}")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 CodeMethod 可执行程序")
     parser.add_argument("--onedir", action="store_true", help="只构建目录模式 (启动更快)")
@@ -294,6 +366,16 @@ def main() -> int:
                 print("自检未通过, 构建视为失败。", file=sys.stderr)
                 return 5
 
+    # 清掉中间产物并检查发行物布局 (防止用户点到跑不起来的半成品)
+    remove_staging_exe()
+    write_build_readme(version)
+    layout_problems = verify_layout(built)
+    if layout_problems:
+        print("\n发行物布局检查未通过:", file=sys.stderr)
+        for item in layout_problems:
+            print("  • " + item, file=sys.stderr)
+        return 6
+
     zip_path = make_zip(version) if args.zip else ""
 
     print()
@@ -303,7 +385,11 @@ def main() -> int:
     if zip_path:
         report_artifact(zip_path)
     print()
-    print("完成。双击 dist/CodeMethod.exe 即可运行 (或用 --demo 载入示例库)。")
+    print("请运行上面的 dist 产物 (不要运行 build/ 下的中间文件):")
+    if any(os.path.basename(os.path.dirname(p)) != "CodeMethod" for p in built):
+        print("  单文件版: dist\\CodeMethod.exe          ← 拷走即可, 只有一个文件")
+    if any(os.path.basename(os.path.dirname(p)) == "CodeMethod" for p in built):
+        print("  目录版:   dist\\CodeMethod\\CodeMethod.exe ← 整个 CodeMethod\\ 文件夹一起拷贝")
     return 0
 
 
