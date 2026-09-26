@@ -48,6 +48,7 @@ from ..storage.database import Database, DatabaseError
 from .dialogs.about_dialog import AboutDialog
 from .dialogs.container_dialog import ContainerInfoDialog, VerifyResultDialog
 from .dialogs.entry_editor import EntryEditorDialog
+from .dialogs.implementation_dialog import ImplementationDialog
 from .dialogs.tag_manager import TagManagerDialog
 from .resources import app_icon
 from .theme import Theme, apply_theme, get_theme
@@ -200,6 +201,10 @@ class MainWindow(QMainWindow):
         self.query = QuerySpec()
         self._current_entry_id: str = ""
         self._suspend_refresh = False
+        # refresh_list 重建列表期间置位: 抑制 currentChanged 引发的重复详情刷新
+        self._suppress_selection_signal = False
+        # 窗口正在关闭/析构: 此后所有刷新槽函数直接返回
+        self._tearing_down = False
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -268,6 +273,18 @@ class MainWindow(QMainWindow):
 
         self.act_new_entry = self._act("新建条目", self.new_entry, shortcut="Ctrl+N", tip="新建一个功能条目")
         self.act_edit_entry = self._act("编辑条目", self.edit_entry, shortcut="Ctrl+E", tip="编辑当前条目与全部实现")
+        self.act_add_impl = self._act(
+            "添加语言实现…",
+            lambda: self.add_implementation(),
+            shortcut="Ctrl+L",
+            tip="为当前条目再添加一种语言的实现 — 同一个问题, 不同语言的解法",
+        )
+        self.act_edit_impl = self._act(
+            "编辑当前语言实现…",
+            lambda: self.edit_implementation(),
+            shortcut="Ctrl+Shift+E",
+            tip="编辑当前页签对应语言的实现",
+        )
         self.act_duplicate_entry = self._act("创建副本", self.duplicate_entry)
         self.act_delete_entry = self._act("删除条目", self.delete_entry, shortcut="Ctrl+Delete", tip="移入回收站 (可在历史中恢复)")
         self.act_restore_entry = self._act("从回收站恢复", self.restore_entry)
@@ -380,6 +397,10 @@ class MainWindow(QMainWindow):
         edit_menu = bar.addMenu("编辑(&E)")
         edit_menu.addAction(self.act_new_entry)
         edit_menu.addAction(self.act_edit_entry)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.act_add_impl)
+        edit_menu.addAction(self.act_edit_impl)
+        edit_menu.addSeparator()
         edit_menu.addAction(self.act_duplicate_entry)
         edit_menu.addAction(self.act_delete_entry)
         edit_menu.addAction(self.act_restore_entry)
@@ -429,6 +450,7 @@ class MainWindow(QMainWindow):
 
         bar.addAction(self.act_new_entry)
         bar.addAction(self.act_edit_entry)
+        bar.addAction(self.act_add_impl)
         bar.addAction(self.act_delete_entry)
         bar.addSeparator()
         bar.addAction(self.act_undo)
@@ -480,6 +502,9 @@ class MainWindow(QMainWindow):
         self.detail_panel.tag_clicked.connect(self.on_tag_chip_clicked)
         self.detail_panel.copy_done.connect(self.set_status)
         self.detail_panel.export_requested.connect(self.on_export_requested)
+        self.detail_panel.add_implementation_requested.connect(self.add_implementation)
+        self.detail_panel.edit_implementation_requested.connect(self.edit_implementation)
+        self.detail_panel.delete_implementation_requested.connect(self.delete_implementation)
 
         self.history_panel.restore_requested.connect(self.restore_revision)
         self.history_panel.undo_requested.connect(lambda _id: self.undo())
@@ -488,15 +513,20 @@ class MainWindow(QMainWindow):
     # ==================================================================================
     # 刷新
     # ==================================================================================
+    #
+    # 关键: 详情面板的刷新**不能依赖列表的选中信号**。
+    # 重新选中"同一行"时 Qt 不会发出 currentChanged, 因此
+    #   "编辑条目 / 改标签 / 切状态 / 回滚之后调用 refresh_all()"
+    # 这类"内容变了但选中行没变"的场景会漏刷新, 界面停在旧内容上。
+    # 所以 refresh_list() 重建列表后会显式同步选中项并刷新详情, 不再依赖信号。
     def refresh_all(self, *, select_id: str = "", keep_selection: bool = True) -> None:
-        if self._suspend_refresh:
+        if self._suspend_refresh or self._tearing_down:
             return
-        previous = select_id or (self._current_entry_id if keep_selection else "")
+        desired = select_id or (self._current_entry_id if keep_selection else "")
         self.refresh_tags()
-        self.refresh_list(select_id=previous)
+        self.refresh_list(select_id=desired)
         self.refresh_stats()
         self.update_titles()
-        self.update_actions()
 
     def refresh_tags(self) -> None:
         colors = {key: info.color for key, info in self.db.repository.tags.items()}
@@ -506,30 +536,50 @@ class MainWindow(QMainWindow):
             colors,
         )
 
-    def refresh_list(self, *, select_id: str = "") -> None:
+    def refresh_list(self, *, select_id: str = "", sync_detail: bool = True) -> None:
+        """重建条目列表。``sync_detail=True`` 时一并同步选中项与详情面板。"""
+        if self._tearing_down:
+            return
         revision_counts = {
             entry.id: self.db.repository.history.count(entry.id)
             for entry in self.db.repository.entries.values()
         }
         tag_colors = {key: info.color for key, info in self.db.repository.tags.items()}
         entries = query_entries(self.db.repository, self.query)
-        self.entry_list.set_entries(
-            entries, revision_counts=revision_counts, tag_colors=tag_colors
-        )
-        if select_id:
-            self.entry_list.select_entry(select_id)
+
+        # 重建期间抑制选中信号: 模型 reset 会产生"先失效再选中"的中间态, 没有必要反复重建详情
+        self._suppress_selection_signal = True
+        try:
+            self.entry_list.set_entries(
+                entries, revision_counts=revision_counts, tag_colors=tag_colors
+            )
+            if select_id:
+                self.entry_list.select_entry(select_id)
+        finally:
+            self._suppress_selection_signal = False
+
+        # 以列表真实的选中项为准, 保证 _current_entry_id 与界面高亮永远一致
+        self._current_entry_id = self.entry_list.current_entry_id()
         self.update_status_counts(len(entries))
+
+        if sync_detail:
+            self.refresh_detail()
+            self.update_actions()
 
     def refresh_stats(self) -> None:
         self.stats_panel.update_stats(self.db.repository, self.db)
 
     def refresh_detail(self) -> None:
+        if self._tearing_down:
+            return
         entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
         tag_colors = {key: info.color for key, info in self.db.repository.tags.items()}
         self.detail_panel.set_entry(entry, tag_colors=tag_colors)
         self.refresh_history()
 
     def refresh_history(self) -> None:
+        if self._tearing_down:
+            return
         entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
         if entry is None:
             self.history_panel.set_entry(None)
@@ -567,6 +617,8 @@ class MainWindow(QMainWindow):
         has_entry = bool(self._current_entry_id)
         entry = self.db.repository.get(self._current_entry_id) if has_entry else None
         self.act_edit_entry.setEnabled(has_entry)
+        self.act_add_impl.setEnabled(has_entry)
+        self.act_edit_impl.setEnabled(has_entry)
         self.act_delete_entry.setEnabled(has_entry and not (entry and entry.deleted))
         self.act_restore_entry.setEnabled(bool(entry and entry.deleted))
         self.act_purge_entry.setEnabled(has_entry)
@@ -590,28 +642,36 @@ class MainWindow(QMainWindow):
     # 选择 / 检索
     # ==================================================================================
     def on_entry_selected(self, entry_id: str) -> None:
-        if entry_id == self._current_entry_id:
+        """用户在列表里切换选中项 (由 QListView.currentChanged 驱动)。
+
+        ``refresh_list`` 重建列表期间会把该信号关掉 (``_suppress_selection_signal``),
+        由它自己统一收口, 避免出现"先清空再填充"的中间态。
+        """
+        if self._suppress_selection_signal or self._tearing_down:
             return
         self._current_entry_id = entry_id
         self.refresh_detail()
         self.update_actions()
-        entry = self.db.repository.get(entry_id)
-        if entry is not None:
-            self.status_entry.setText(
-                f"{entry.display_title} · {entry.status_label} · "
-                f"{len(entry.active_implementations)} 实现 · {len(entry.tags)} 标签"
-            )
-        else:
+        self.update_status_entry()
+
+    def update_status_entry(self) -> None:
+        entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
+        if entry is None:
             self.status_entry.setText("")
+            return
+        self.status_entry.setText(
+            f"{entry.display_title} · {entry.status_label} · "
+            f"{len(entry.active_implementations)} 种语言 · {len(entry.tags)} 标签"
+        )
 
     def on_entry_activated(self, entry_id: str) -> None:
         self._current_entry_id = entry_id
+        self.refresh_detail()
         self.edit_entry()
 
     def on_query_changed(self, text: str) -> None:
         self.query.text = text
         self.refresh_list(select_id=self._current_entry_id)
-        self.update_actions()
 
     def on_sort_changed(self, sort_key: str) -> None:
         self.query.sort_key = sort_key or "updated_desc"
@@ -626,7 +686,6 @@ class MainWindow(QMainWindow):
         self.query.tags = list(tags)
         self.query.tag_mode = TagMatch(mode)
         self.refresh_list(select_id=self._current_entry_id)
-        self.update_actions()
 
     def on_tag_chip_clicked(self, tag: str) -> None:
         self.tag_panel.toggle_tag(tag)
@@ -848,6 +907,92 @@ class MainWindow(QMainWindow):
         self.refresh_all(select_id=entry_id)
         self.set_status(f"已全量回滚到 {format_ts(revision.timestamp)} 的版本, 并记录为一条新的修订")
 
+    # ==================================================================================
+    # 多语言实现 (同一个问题, 多种语言的解法)
+    # ==================================================================================
+    def add_implementation(self, entry_id: str = "") -> None:
+        """为条目添加**另一种语言**的实现 (详情面板的「＋ 语言实现」)。"""
+        entry = self.db.repository.get(entry_id) if entry_id else self._current_entry()
+        if entry is None:
+            self.set_status("请先选中一个条目")
+            return
+
+        dialog = ImplementationDialog(self, entry=entry, theme=self.theme)
+        if dialog.exec() != ImplementationDialog.DialogCode.Accepted:
+            return
+
+        impl = dialog.result_implementation()
+        created = self.db.repository.add_implementation(
+            entry.id,
+            impl.language,
+            impl.code,
+            title=impl.title,
+            filename=impl.filename,
+            notes=impl.notes,
+        )
+        self.refresh_all(select_id=entry.id)
+        self.detail_panel.show_implementation(created.id)
+        self.set_status(
+            f"已为《{entry.display_title}》添加 {get_language(created.language).name} 实现 — "
+            f"该条目现在有 {len(self.db.repository.require(entry.id).active_implementations)} 种语言实现"
+        )
+
+    def edit_implementation(self, entry_id: str = "", implementation_id: str = "") -> None:
+        """编辑条目下的某一种语言实现。"""
+        entry = self.db.repository.get(entry_id) if entry_id else self._current_entry()
+        if entry is None:
+            return
+        impl_id = implementation_id or self.detail_panel.current_implementation_id()
+        impl = entry.get_implementation(impl_id) if impl_id else None
+        if impl is None:
+            self.set_status("请先在「概览」里选择要编辑的语言实现")
+            return
+
+        dialog = ImplementationDialog(
+            self, entry=entry, implementation=impl.clone(), theme=self.theme
+        )
+        if dialog.exec() != ImplementationDialog.DialogCode.Accepted:
+            return
+
+        updated = dialog.result_implementation()
+        before_code = impl.code
+        self.db.repository.update_implementation(
+            entry.id,
+            impl.id,
+            language=updated.language,
+            code=updated.code,
+            title=updated.title,
+            filename=updated.filename,
+            notes=updated.notes,
+        )
+        self.refresh_all(select_id=entry.id)
+        self.detail_panel.show_implementation(impl.id)
+        if before_code != updated.code:
+            added = sum(
+                1 for line in updated.code.splitlines() if line not in before_code.splitlines()
+            )
+            self.set_status(
+                f"已保存 {get_language(updated.language).name} 实现 "
+                f"(代码 {len(before_code.splitlines())} → {len(updated.code.splitlines())} 行), 已记录到历史"
+            )
+        else:
+            self.set_status(f"已保存 {get_language(updated.language).name} 实现的元信息")
+
+    def delete_implementation(self, entry_id: str = "", implementation_id: str = "") -> None:
+        """删除条目下的某一种语言实现 (软删除, 可从历史回滚)。"""
+        entry = self.db.repository.get(entry_id) if entry_id else self._current_entry()
+        if entry is None or not implementation_id:
+            return
+        impl = entry.get_implementation(implementation_id)
+        if impl is None:
+            return
+        language = get_language(impl.language).name
+        self.db.repository.delete_implementation(entry.id, implementation_id)
+        self.refresh_all(select_id=entry.id)
+        self.set_status(
+            f"已删除 {language} 实现 (内容仍在历史中, 可用 Ctrl+Z 或回滚恢复)"
+        )
+
     def show_history_panel(self) -> None:
         self.history_panel.setVisible(True)
         self.act_show_history.setChecked(True)
@@ -941,23 +1086,23 @@ class MainWindow(QMainWindow):
     # 复制 / 导出
     # ==================================================================================
     def copy_current_code(self) -> None:
+        """复制当前详情页签对应语言的实现 (不依赖私有控件下标)。"""
         entry = self._current_entry()
         if entry is None:
             return
-        index = self.detail_panel.tabs.currentIndex()
-        previews = self.detail_panel._previews
-        if 0 < index <= len(previews):
-            preview = previews[index - 1]
-        elif previews:
-            preview = previews[0]
-        else:
-            self.set_status("该条目没有可复制的代码")
-            return
-        text = preview.code()
-        QApplication.clipboard().setText(text)
+        impl_id = self.detail_panel.current_implementation_id()
+        impl = entry.get_implementation(impl_id) if impl_id else None
+        if impl is None:
+            actives = entry.active_implementations
+            if not actives:
+                self.set_status("该条目还没有任何语言实现, 用「＋ 语言实现」添加")
+                return
+            impl = actives[0]
+        QApplication.clipboard().setText(impl.code)
+        line_count = len(impl.code.splitlines())
         self.set_status(
-            f"已复制 {get_language(preview.language).name} 实现 "
-            f"({text.count(chr(10)) + 1 if text else 0} 行, {len(text)} 字符) 到剪贴板"
+            f"已复制 {get_language(impl.language).name} 实现 "
+            f"({line_count} 行, {len(impl.code)} 字符) 到剪贴板"
         )
 
     def copy_entry_as(self, fmt: str) -> None:
@@ -1333,6 +1478,14 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._save_geometry()
+        # 关窗后组件很快会被析构, 但 QListView 的 currentChanged 仍可能在析构过程中触发;
+        # 不断开的话槽函数会去访问已销毁的子控件而抛 RuntimeError (在 PySide6 里会 abort 进程)。
+        self._tearing_down = True
+        try:
+            self.entry_list.selection_changed.disconnect()
+            self.entry_list.entry_activated.disconnect()
+        except (RuntimeError, TypeError):
+            pass
         event.accept()
 
 

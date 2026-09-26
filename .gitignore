@@ -22,6 +22,7 @@ build_assets/*.ico
 _shots/
 _scratch_*.py
 _*.py
+_*.txt
 *.cmdb.tmp-*
 *.cmj.tmp-*
 

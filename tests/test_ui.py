@@ -18,6 +18,8 @@ try:
 
     qInstallMessageHandler(lambda *args: None)
     from codemethod.core.languages import LANGUAGES, all_languages
+    from codemethod.core.models import Implementation
+    from codemethod.core.repository import Repository
     from codemethod.storage.database import Database
     from codemethod.ui.editor import CodeEditor, CodePreview, DiffView
     from codemethod.ui.highlighter import build_rules, highlighted_tokens
@@ -40,6 +42,44 @@ SAMPLES = {
     "php": '<?php\nfunction f($x) {\n    # 注释\n    return "值 $x";\n}\n',
     "rust": 'fn main() {\n    /* 嵌套 /* 注释 */ 仍在注释中 */\n    let s = r"raw";\n    println!("{}", s);\n}\n',
 }
+
+
+class _TrackedWidgets(unittest.TestCase):
+    """界面测试基类: 保证测试创建的 QWidget 在 QApplication 还活着时被销毁。
+
+    未销毁的 QWidget 会留到后续 GC 或解释器关闭阶段才回收, 那时 Qt 内部的销毁顺序
+    不可控, 进程会直接崩溃 —— 表现为"所有测试都 ok, 退出码却是非零"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        apply_theme(cls.app, DARK_PLUS)
+        # 自动应答模态框, 避免无头测试卡住
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+        QMessageBox.critical = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    def setUp(self):
+        self._tracked: list = []
+
+    def tearDown(self):
+        while self._tracked:
+            widget = self._tracked.pop()
+            try:
+                widget.close()          # 触发 closeEvent, 让窗口进入 teardown 状态并断开信号
+                widget.setParent(None)
+                widget.deleteLater()
+            except RuntimeError:  # 已被 C++ 侧回收
+                pass
+        for _ in range(3):
+            self.app.processEvents()
+
+    def track(self, widget):
+        """登记部件, 测试结束统一销毁。"""
+        self._tracked.append(widget)
+        return widget
 
 
 @unittest.skipUnless(PYSIDE, "需要 PySide6")
@@ -113,14 +153,9 @@ class TestHighlighter(unittest.TestCase):
 
 
 @unittest.skipUnless(PYSIDE, "需要 PySide6")
-class TestWidgets(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-        apply_theme(cls.app, DARK_PLUS)
-
+class TestWidgets(_TrackedWidgets):
     def test_editor_line_numbers_and_language_switch(self):
-        editor = CodeEditor(language="python")
+        editor = self.track(CodeEditor(language="python"))
         editor.setPlainText("a = 1\nb = 2\nc = 3")
         self.assertEqual(editor.total_lines(), 3)
         editor.goto_line(2)
@@ -167,21 +202,12 @@ class TestWidgets(unittest.TestCase):
 
 
 @unittest.skipUnless(PYSIDE, "需要 PySide6")
-class TestMainWindow(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-        apply_theme(cls.app, DARK_PLUS)
-        # 自动应答模态对话框, 避免测试阻塞
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
-        QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
-        QMessageBox.information = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
-
+class TestMainWindow(_TrackedWidgets):
     def _make_window(self):
         from codemethod.app import build_demo_repository
 
         db = Database(build_demo_repository())
-        window = MainWindow(db)
+        window = self.track(MainWindow(db))
         window.show()
         self.app.processEvents()
         return window, db
@@ -284,6 +310,371 @@ class TestMainWindow(unittest.TestCase):
         self.assertTrue(result.verified)
         self.assertEqual(Database.open(target).repository.name, db.repository.name)
         window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestDetailPanelRefresh(_TrackedWidgets):
+    """回归测试: 详情面板必须跟随内容刷新。
+
+    历史 bug —— ``refresh_all()`` 依赖 QListView 的 currentChanged 去刷新详情, 但
+    "重新选中同一行"时 Qt 根本不发这个信号, 于是"编辑条目 / 改标签 / 切状态 / 回滚"
+    之后右侧详情仍停在旧内容上。这里的每个用例都刻意让选中行保持不变, 因此能锁住该回归。
+    """
+
+    def _window_with_entries(self, count=3):
+        db = Database(Repository(name="refresh"))
+        for index in range(count):
+            entry = db.repository.create_entry(
+                f"问题 {index + 1}", f"描述 {index + 1}", "无", ["t"]
+            )
+            db.repository.add_implementation(
+                entry.id, "python", f"# solution {index + 1}\nprint({index + 1})"
+            )
+        window = self.track(MainWindow(db))
+        window.show()
+        self.app.processEvents()
+        return window, db
+
+    def _select_row(self, window, row):
+        model = window.entry_list.entry_model
+        window.entry_list.setCurrentIndex(model.index(row, 0))
+        self.app.processEvents()
+        return model.entry_at(model.index(row, 0))
+
+    def test_selection_updates_detail(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        self.assertIsNotNone(window.detail_panel.current_entry())
+        self.assertEqual(window.detail_panel.current_entry().id, target.id)
+        window.close()
+
+    def test_detail_follows_title_change_with_same_selection(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)  # 非首行才会暴露原 bug
+        db.repository.update_entry(target.id, title="改过的标题")
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, "改过的标题")
+        window.close()
+
+    def test_detail_follows_description_and_status_change(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        db.repository.update_entry(target.id, description="新描述", status="done")
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        shown = window.detail_panel.current_entry()
+        self.assertEqual(shown.description, "新描述")
+        self.assertEqual(shown.status, "done")
+        window.close()
+
+    def test_detail_follows_tag_change(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        db.repository.update_entry(target.id, tags=["t", "新增标签"])
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        self.assertIn("新增标签", window.detail_panel.current_entry().tags)
+        window.close()
+
+    def test_detail_follows_favorite_toggle(self):
+        window, db = self._window_with_entries()
+        self._select_row(window, 1)
+        window.toggle_favorite()
+        self.app.processEvents()
+        self.assertTrue(window.detail_panel.current_entry().favorite)
+        window.close()
+
+    def test_detail_follows_code_change(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        impl = target.active_implementations[0]
+        db.repository.update_implementation(target.id, impl.id, code="print('NEW CODE')")
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        self.assertIn("NEW CODE", window.detail_panel._previews[0].code())
+        window.close()
+
+    def test_detail_follows_undo_and_redo(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        original = target.title
+        db.repository.update_entry(target.id, title="标题B")
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, "标题B")
+
+        window.undo()
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, original)
+        window.redo()
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, "标题B")
+        window.close()
+
+    def test_detail_follows_revision_restore(self):
+        window, db = self._window_with_entries()
+        target = self._select_row(window, 1)
+        # 注意: target 是仓储里的活对象, 会被就地修改, 所以先记下原始标题字符串
+        original_title = target.title
+        first_revision = db.repository.revisions(target.id, descending=False)[0]
+        db.repository.update_entry(target.id, title="临时标题")
+        window.refresh_all(select_id=target.id)
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, "临时标题")
+
+        window.restore_revision(target.id, first_revision.id)
+        self.app.processEvents()
+        self.assertEqual(window.detail_panel.current_entry().title, original_title)
+        window.close()
+
+    def test_detail_clears_when_query_matches_nothing(self):
+        window, db = self._window_with_entries()
+        self._select_row(window, 0)
+        window.search_bar.set_text("绝对不存在的关键词zzz")
+        self.app.processEvents()
+        self.assertIsNone(window.detail_panel.current_entry())
+        window.clear_search()
+        self.app.processEvents()
+        self.assertIsNotNone(window.detail_panel.current_entry())
+        window.close()
+
+    def test_current_entry_id_matches_highlighted_row(self):
+        window, db = self._window_with_entries()
+        for row in range(3):
+            target = self._select_row(window, row)
+            self.assertEqual(window._current_entry_id, target.id)
+        window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestMultiLanguageImplementations(_TrackedWidgets):
+    """一个问题可以用多种语言实现。"""
+
+    def _window(self):
+        db = Database.create()
+        entry = db.repository.create_entry("字符串反转", "把字符串逆序", "无", ["string"])
+        db.repository.add_implementation(entry.id, "python", "def rev(s): return s[::-1]")
+        window = self.track(MainWindow(db))
+        window.show()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        return window, db, entry
+
+    def test_detail_has_one_tab_per_language(self):
+        window, db, entry = self._window()
+        for language, code in (
+            ("go", "package main"),
+            ("rust", "fn main() {}"),
+            ("cpp", "int main() {}"),
+        ):
+            db.repository.add_implementation(entry.id, language, code)
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        self.assertEqual(len(db.repository.require(entry.id).active_implementations), 4)
+        self.assertEqual(window.detail_panel.tabs.count(), 5)  # 概览 + 4 种语言
+        self.assertEqual(window.detail_panel.tabs.tabText(0), "概览")
+        window.close()
+
+    def test_language_tabs_are_switchable_and_copy_matches(self):
+        window, db, entry = self._window()
+        db.repository.add_implementation(entry.id, "rust", 'fn main() { println!("RS"); }')
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        implementations = db.repository.require(entry.id).active_implementations
+        rust_impl = next(i for i in implementations if i.language == "rust")
+        self.assertTrue(window.detail_panel.show_implementation(rust_impl.id))
+        self.app.processEvents()
+
+        window.copy_current_code()
+        self.assertIn("println!", QApplication.clipboard().text())
+        window.close()
+
+    def test_current_implementation_id_tracks_tab(self):
+        window, db, entry = self._window()
+        db.repository.add_implementation(entry.id, "go", "package main")
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        implementations = db.repository.require(entry.id).active_implementations
+        for index, impl in enumerate(implementations):
+            window.detail_panel.show_tab(index + 1)
+            self.assertEqual(window.detail_panel.current_implementation_id(), impl.id)
+        window.detail_panel.show_tab(0)  # 概览页签没有对应实现
+        self.assertEqual(window.detail_panel.current_implementation_id(), "")
+        window.close()
+
+    def test_implementation_dialog_suggests_unused_language(self):
+        from codemethod.ui.dialogs.implementation_dialog import ImplementationDialog
+
+        window, db, entry = self._window()
+        dialog = ImplementationDialog(window, entry=entry, theme=DARK_PLUS)
+        suggested = dialog.editor.language_combo.currentData()
+        self.assertNotIn(suggested, entry.languages)
+        dialog.close()
+        window.close()
+
+    def test_add_implementation_through_dialog_persists(self):
+        from codemethod.ui.dialogs.implementation_dialog import ImplementationDialog
+
+        window, db, entry = self._window()
+        dialog = ImplementationDialog(window, entry=entry, theme=DARK_PLUS)
+        dialog.editor.language_combo.setCurrentIndex(
+            dialog.editor.language_combo.findData("java")
+        )
+        dialog.editor.editor.setPlainText("public class Solution {}")
+        result = dialog.result_implementation()
+        self.assertEqual(result.language, "java")
+
+        db.repository.add_implementation(entry.id, result.language, result.code)
+        dialog.close()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        languages = db.repository.require(entry.id).languages
+        self.assertIn("java", languages)
+        self.assertEqual(len(languages), 2)
+        window.close()
+
+    def test_deleting_one_language_keeps_others_and_is_reversible(self):
+        window, db, entry = self._window()
+        db.repository.add_implementation(entry.id, "go", "package main")
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        go_impl = next(
+            i for i in db.repository.require(entry.id).active_implementations
+            if i.language == "go"
+        )
+        db.repository.delete_implementation(entry.id, go_impl.id)
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        self.assertEqual(len(db.repository.require(entry.id).active_implementations), 1)
+        self.assertTrue(
+            any(
+                "回收" in window.detail_panel.tabs.tabText(i)
+                for i in range(window.detail_panel.tabs.count())
+            )
+        )
+
+        window.undo()
+        self.app.processEvents()
+        self.assertEqual(len(db.repository.require(entry.id).active_implementations), 2)
+        self.assertEqual(window.detail_panel.tabs.count(), 3)
+        window.close()
+
+    def test_entry_editor_can_add_three_languages_at_once(self):
+        from codemethod.ui.dialogs.entry_editor import EntryEditorDialog
+
+        window, db, entry = self._window()
+        dialog = EntryEditorDialog(window, entry=entry, theme=DARK_PLUS)
+        dialog.add_implementation()
+        dialog.add_implementation()
+        self.app.processEvents()
+        self.assertEqual(len(dialog._editors), 3)
+
+        dialog._editors[1].language_combo.setCurrentIndex(
+            dialog._editors[1].language_combo.findData("go")
+        )
+        dialog._editors[2].language_combo.setCurrentIndex(
+            dialog._editors[2].language_combo.findData("rust")
+        )
+        data = dialog.result_data()
+        languages = [impl.language for impl in data["implementations"]]
+        self.assertEqual(languages, ["python", "go", "rust"])
+
+        db.repository.apply_entry(entry.id, implementations=list(data["implementations"]))
+        dialog.close()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        self.assertEqual(len(db.repository.require(entry.id).active_implementations), 3)
+        self.assertEqual(window.detail_panel.tabs.count(), 4)
+        window.close()
+
+    def test_each_language_change_is_recorded_in_history(self):
+        window, db, entry = self._window()
+        before = db.repository.history.count(entry.id)
+        for language in ("go", "rust", "cpp"):
+            db.repository.add_implementation(entry.id, language, f"// {language}")
+
+        timeline = db.repository.revisions(entry.id, descending=False)
+        # _window() 里已经加过一个 python 实现, 所以这里是 1 + 3
+        self.assertEqual([r.action for r in timeline].count("impl_add"), 4)
+        self.assertEqual(db.repository.history.count(entry.id), before + 3)
+        language_snapshots = [
+            r.snapshot["implementations"][-1]["language"]
+            for r in timeline
+            if r.action == "impl_add"
+        ]
+        self.assertEqual(language_snapshots, ["python", "go", "rust", "cpp"])
+        window.close()
+
+    def test_copy_all_code_includes_every_language(self):
+        window, db, entry = self._window()
+        db.repository.add_implementation(entry.id, "go", "package main // GO")
+        db.repository.add_implementation(entry.id, "rust", "fn main() // RUST")
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+
+        window.detail_panel._copy_all_code()
+        clipboard = QApplication.clipboard().text()
+        self.assertIn("GO", clipboard)
+        self.assertIn("RUST", clipboard)
+        self.assertIn("Python", clipboard)
+        window.close()
+
+    def test_switching_language_updates_filename_extension(self):
+        """回归: 语言切到 PHP 后, 文件名不能还是 main.c。"""
+        editor = self._make_editor()
+        editor.language_combo.setCurrentIndex(editor.language_combo.findData("c"))
+        self.assertTrue(editor.filename_edit.text().endswith(".c"))
+
+        editor.language_combo.setCurrentIndex(editor.language_combo.findData("php"))
+        self.assertTrue(
+            editor.filename_edit.text().endswith(".php"),
+            f"文件名没有跟随语言: {editor.filename_edit.text()!r}",
+        )
+
+    def test_switching_language_keeps_custom_stem(self):
+        editor = self._make_editor()
+        editor.language_combo.setCurrentIndex(editor.language_combo.findData("c"))
+        editor.filename_edit.setText("reverse.c")
+        editor.language_combo.setCurrentIndex(editor.language_combo.findData("rust"))
+        self.assertEqual(editor.filename_edit.text(), "reverse.rs")
+
+    def test_loaded_implementation_keeps_its_filename(self):
+        editor = self._make_editor()
+        editor.load(
+            Implementation(language="java", filename="Solution.java", code="class Solution {}")
+        )
+        self.assertEqual(editor.filename_edit.text(), "Solution.java")
+        self.assertEqual(editor.language_combo.currentData(), "java")
+
+    # 单独构造的编辑器必须登记清理, 否则解释器退出时 Qt 对象销毁顺序不可控 (会硬崩)
+    def _make_editor(self):
+        from codemethod.ui.dialogs.entry_editor import ImplementationEditor
+
+        return self.track(ImplementationEditor(theme=DARK_PLUS))
+
+
+# --------------------------------------------------------------------------------------
+# 模块级清理
+# --------------------------------------------------------------------------------------
+
+
+def tearDownModule() -> None:
+    """最后再回收一次, 保证 QApplication 析构前没有遗留部件。"""
+    if not PYSIDE:
+        return
+    import gc
+
+    app = QApplication.instance()
+    for _ in range(3):
+        gc.collect()
+        if app is not None:
+            app.processEvents()
 
 
 if __name__ == "__main__":

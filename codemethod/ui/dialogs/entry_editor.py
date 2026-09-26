@@ -62,6 +62,7 @@ class ImplementationEditor(QWidget):
         self._theme = theme
         self._impl = implementation or Implementation(language="python")
         self._loading = True
+        self._language = self._impl.language
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -130,17 +131,30 @@ class ImplementationEditor(QWidget):
             self.changed.emit()
 
     def _on_language_changed(self) -> None:
+        if self._loading:
+            return
         language = self.language_combo.currentData() or "plaintext"
+        previous = self._language
+        self._language = language
         self.editor.set_language(language)
-        # 文件名与语言不匹配时自动纠正
+        self._sync_filename(previous, language)
+        self._on_edited()
+
+    def _sync_filename(self, previous: str, language: str) -> None:
+        """让文件名后缀跟随语言变化。
+
+        仅在文件名"是自动生成/与上一种语言匹配"时才改写, 这样既修好了
+        "语言切到 PHP 但文件名还是 main.c"的问题, 又不会覆盖用户自定义的名字
+        (只把自定义名字的扩展名换成新语言的)。
+        """
         current = self.filename_edit.text().strip()
         if not current:
             self.filename_edit.setText(default_filename(language))
-        else:
-            detected = detect_language_from_filename(current)
-            if detected == "plaintext" and current.count(".") <= 1:
-                self.filename_edit.setText(default_filename(language))
-        self._on_edited()
+            return
+        detected = detect_language_from_filename(current)
+        if detected in (previous, "plaintext"):
+            stem = current.rsplit(".", 1)[0] if "." in current else current
+            self.filename_edit.setText(default_filename(language, stem or "main"))
 
     def _update_stats(self) -> None:
         text = self.editor.toPlainText()
@@ -157,6 +171,7 @@ class ImplementationEditor(QWidget):
         self._impl = implementation
         index = self.language_combo.findData(implementation.language)
         self.language_combo.setCurrentIndex(max(0, index))
+        self._language = implementation.language
         self.title_edit.setText(implementation.title)
         self.filename_edit.setText(implementation.filename)
         self.notes_edit.setText(implementation.notes)

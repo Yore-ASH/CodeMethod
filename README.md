@@ -100,9 +100,23 @@ python -m unittest discover -s tests -t .
 
 - 新建 / 编辑 / 复制 / 删除条目; 删除是**软删除**, 进回收站后可以恢复;
 - 每条记录可写 **描述** 与 **前置要求** 两大段富文本 (支持多行、保留换行);
-- 同一描述可挂 **任意数量的语言实现**, 在编辑对话框里以页签切换;
-- 每个实现可单独设置语言、标题、文件名、备注, 文件名在留空时按语言自动生成;
 - 标签支持自动补全、从已有标签中挑选、颜色自定义。
+
+### 一个问题, 多种语言实现
+
+这是本工具的核心用法: **一条记录 = 一个问题**, 它可以同时挂载任意多种语言的解法。
+
+- **四个随手可用的入口**: 详情页签栏右上角的「＋ 语言实现」按钮、概览页的
+  「＋ 为这个问题添加一种语言实现」按钮、头部 `⋯` 菜单、以及 `Ctrl+L`;
+- 每个实现独立设置**语言 / 标题 / 文件名 / 备注**, 文件名留空时按语言自动生成,
+  切换语言时扩展名会跟着变 (自定义的名字只换后缀, 不会被覆盖);
+- 新增实现时会**自动推荐该条目还没有用过的语言**;
+- 详情面板为**每种语言开一个页签**, 概览页还会列出「语言实现 (N)」清单,
+  每行带 `查看 / 编辑 / 删除` 三个操作;
+- 详情里的代码是**只读预览 + 「编辑」按钮**, 避免在主界面里改了代码却悄悄丢失;
+- 删除某一种语言只影响该语言, 其余实现不受影响, 且整条操作可撤销 / 可回滚;
+- 新增、修改、删除实现各产生一条独立的修订记录 (动作类型 `新增实现` /
+  `修改实现` / `删除实现`)。
 
 ### 规划
 
@@ -123,7 +137,7 @@ python -m unittest discover -s tests -t .
 
 - VSCode 风格代码区: 行号、当前行高亮、括号匹配、自动缩进、Ctrl+滚轮缩放;
 - **语法高亮**支持 22 种语言 (见下);
-- 一键复制单个实现的代码, 或"复制全部代码"(把所有语言拼成一份);
+- 一键复制**当前页签那种语言**的代码, 或"复制全部代码"(把所有语言拼成一份);
 - 复制条目为 **Markdown / JSON**(含完整修订历史)。
 
 ### 历史与回滚
@@ -333,6 +347,7 @@ tag:network lang:go status:done -deprecated
 | 快捷键 | 功能 | 快捷键 | 功能 |
 | --- | --- | --- | --- |
 | `Ctrl+N` | 新建条目 | `Ctrl+E` | 编辑当前条目 |
+| `Ctrl+L` | **添加语言实现** | `Ctrl+Shift+E` | 编辑当前语言实现 |
 | `Ctrl+Shift+N` | 新建代码库 | `Ctrl+T` | 标签管理 |
 | `Ctrl+O` | 打开代码库 | `Ctrl+Shift+T` | 给当前条目添加标签 |
 | `Ctrl+S` | 保存 | `Ctrl+D` | 收藏 / 取消收藏 |
@@ -377,8 +392,9 @@ CodeMethod/
 │       ├── main_window.py      主窗口装配 (菜单/工具栏/面板/状态栏)
 │       ├── widgets/            flow_layout, tag_chip, search_bar, tag_panel,
 │       │                       entry_list (模型+委托), detail_panel, history_panel
-│       └── dialogs/            entry_editor, tag_manager, container_dialog, about
-├── tests/                      169 个单元测试 (unittest, 无需显示器)
+│       └── dialogs/            entry_editor, implementation_dialog, tag_manager,
+│                               container_dialog, about
+├── tests/                      191 个单元测试 (unittest, 无需显示器)
 ├── codemethod.spec             PyInstaller 打包配置
 ├── build.py / build.ps1 / build.bat   一键构建脚本
 ├── pyproject.toml              打包元数据与安装配置
@@ -428,7 +444,7 @@ Quick 等用不到的 Qt 模块, 显著缩小体积。
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 169 个测试
+python -m unittest discover -s tests -t .     # 191 个测试
 python -m pytest                              # 也兼容 pytest
 ```
 
@@ -441,9 +457,13 @@ python -m pytest                              # 也兼容 pytest
 | `test_repository.py` | 每类操作都产生正确动作的修订、软/硬删除、回滚的全量性、标签重命名/合并/删除级联 |
 | `test_query.py` | 查询语法解析、AND/OR/NOT/EXACT 标签组合、字段限定符、短语与排除、10 种排序 |
 | `test_storage.py` | 两种容器往返、64/32 字节头部规范、**篡改与截断检测**、原子写入、滚动备份、格式转换、合并去冲突、导出与回读 |
-| `test_ui.py` | 22 种语言的高亮规则合法性与 token 产出、跨行注释/字符串、编辑器与预览部件、主窗口端到端操作 (离屏) |
+| `test_ui.py` | 22 种语言的高亮规则合法性与 token 产出、跨行注释/字符串、编辑器与预览部件、主窗口端到端操作 (离屏)、**详情面板刷新回归**、**多种语言实现的增删改与历史** |
 
 界面测试使用 `QT_QPA_PLATFORM=offscreen`, 因此**不需要显示器**, 可在 CI 中运行。
+
+> 界面测试基类 `_TrackedWidgets` 会登记并在每个用例结束时销毁所创建的 QWidget。
+> 这一步是必需的: 遗留的部件若等到解释器关闭阶段才被 GC, Qt 的销毁顺序不可控,
+> 进程会直接崩掉 —— 表现为"所有测试都 ok, 退出码却是非零"。
 
 ---
 
