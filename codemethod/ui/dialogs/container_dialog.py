@@ -16,10 +16,11 @@ from PySide6.QtWidgets import (
 )
 
 from ...storage.container import ContainerInfo, human_size
+from ..native import ThemedDialog
 from ..theme import DEFAULT_THEME, Theme
 
 
-class ContainerInfoDialog(QDialog):
+class ContainerInfoDialog(ThemedDialog):
     """展示 ``.cmdb`` / ``.cmj`` 容器的元信息。"""
 
     def __init__(
@@ -79,7 +80,7 @@ class ContainerInfoDialog(QDialog):
         root.addWidget(box)
 
 
-class VerifyResultDialog(QDialog):
+class VerifyResultDialog(ThemedDialog):
     """完整性校验结果。"""
 
     def __init__(

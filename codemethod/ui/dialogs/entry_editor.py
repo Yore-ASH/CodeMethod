@@ -42,6 +42,7 @@ from ...core.models import (
     normalize_tags,
 )
 from ..editor import CodeEditor
+from ..native import ThemedDialog
 from ..theme import DEFAULT_THEME, Theme
 
 
@@ -250,7 +251,7 @@ class ImplementationEditor(QWidget):
         return not self.editor.toPlainText().strip()
 
 
-class EntryEditorDialog(QDialog):
+class EntryEditorDialog(ThemedDialog):
     """新建 / 编辑一个条目 (含全部语言实现)。"""
 
     def __init__(

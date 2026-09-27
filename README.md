@@ -164,6 +164,31 @@ Rust 版要 cargo。因此前置要求分两层:
 - 一键复制**当前页签那种语言**的代码, 或"复制全部代码"(把所有语言拼成一份);
 - 复制条目为 **Markdown / JSON**(含完整修订历史)。
 
+### 主题 (含原生标题栏)
+
+「视图 → 主题」里内置 5 套配色, 用 `Ctrl+Shift+Y` 可以循环切换:
+
+| 主题 | 风格 |
+| --- | --- |
+| **Dark+ (默认)** | VSCode 经典深色, 状态栏为标志性的蓝色 |
+| **深海 (Deep Sea)** | 近乎黑的深蓝, 灵感来自深海与深海探测器仪表盘, 青色强调 |
+| **VSCode Red** | 经典 Dark+ 的底子, 状态栏 / 强调色 / 选中态换成红色系 |
+| **Dracula (紫夜)** | 深紫夜色, 高对比度, 长时间读代码不累 |
+| **Light+ (浅色)** | 白色 / 浅灰, 适合白天或投屏 |
+
+配色不是随手填的: 测试会对每套主题做 **WCAG 对比度校验** —— 正文与窗口/编辑器/侧边栏
+背景的对比度必须 ≥ 4.5, 语法 token 与编辑器背景 ≥ 2.5, 状态栏文字 ≥ 3.0。
+不达标的主题过不了测试, 所以不会出现"某个主题看不清"的情况。
+
+**原生标题栏也会跟着换色。** `QWidget.grab()` 只截客户区, 所以纯 Qt 样式表管不到
+系统绘制的标题栏 —— 深色主题下顶部就会残留一条白框。程序通过 DWM 接口
+(`DWMWA_USE_IMMERSIVE_DARK_MODE` / `DWMWA_CAPTION_COLOR` / `DWMWA_TEXT_COLOR` /
+`DWMWA_BORDER_COLOR`) 把标题栏、标题文字和边框一并染色; 非 Windows 平台或旧系统上
+会安静地退化为无操作。切换主题时所有已打开的窗口 (含各种对话框) 都会同步更新。
+
+新增一套主题只需要在 `codemethod/ui/theme.py` 里加一个 `Theme(...)` 实例并放进
+`THEMES` —— 菜单、快捷键循环、对比度测试都会自动覆盖它。
+
 ### 历史与回滚
 
 - 任何修改 (改标题、改代码、加标签、改状态、删除实现…) 都产生一条修订记录;
@@ -382,7 +407,8 @@ tag:network lang:go status:done -deprecated
 | `Esc` | 清空检索条件 | `Ctrl+H` | 显示 / 隐藏历史面板 |
 | `Ctrl+Shift+C` | 复制当前实现代码 | `Ctrl+Shift+M` | 复制条目为 Markdown |
 | `Ctrl+1` / `Ctrl+2` | 切换侧边栏 | `F5` | 刷新 |
-| `F1` | 快捷键与检索语法帮助 | `Ctrl+滚轮` | 缩放代码字号 |
+| `Ctrl+Shift+Y` | 循环切换主题 | `F1` | 快捷键与检索语法帮助 |
+| `Ctrl+滚轮` | 缩放代码字号 | | |
 
 编辑器内: `Tab` / `Shift+Tab` 缩进与反缩进 (支持多行选区), `Enter` 自动缩进并在
 `:`、`{`、`(`、`[` 后自动多缩进一级、自动补全右括号所在行, `Home` 智能跳到首个非空白字符,
@@ -419,7 +445,7 @@ CodeMethod/
 │       │                       entry_list (模型+委托), detail_panel, history_panel
 │       └── dialogs/            entry_editor, implementation_dialog, tag_manager,
 │                               container_dialog, about
-├── tests/                      226 个单元测试 (unittest, 无需显示器)
+├── tests/                      243 个单元测试 (unittest, 无需显示器)
 ├── codemethod.spec             PyInstaller 打包配置
 ├── build.py / build.ps1 / build.bat   一键构建脚本
 ├── pyproject.toml              打包元数据与安装配置
@@ -447,7 +473,7 @@ codemethod --demo          # 安装后可直接运行
 .\build.ps1                    # 单文件 dist\CodeMethod.exe
 .\build.ps1 -OneDir            # 目录版 dist\CodeMethod\ (启动更快)
 .\build.ps1 -All -Zip          # 两种都构建, 并额外产出分发包 zip
-.\build.ps1 -Tests -Clean      # 先跑 226 个测试并清理旧产物
+.\build.ps1 -Tests -Clean      # 先跑 243 个测试并清理旧产物
 ```
 
 或者直接用 Python / 批处理:
@@ -532,7 +558,7 @@ dist\CodeMethod.exe --selftest report.txt
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 226 个测试
+python -m unittest discover -s tests -t .     # 243 个测试
 python -m pytest                              # 也兼容 pytest
 ```
 

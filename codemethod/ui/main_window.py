@@ -17,7 +17,7 @@ import os
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -51,7 +51,7 @@ from .dialogs.entry_editor import EntryEditorDialog
 from .dialogs.implementation_dialog import ImplementationDialog
 from .dialogs.tag_manager import TagManagerDialog
 from .resources import app_icon
-from .theme import Theme, apply_theme, get_theme
+from .theme import THEMES, Theme, apply_theme, get_theme, theme_names
 from .widgets.detail_panel import DetailPanel
 from .widgets.entry_list import EntryListView
 from .widgets.history_panel import HistoryPanel
@@ -313,6 +313,12 @@ class MainWindow(QMainWindow):
         self.act_shortcuts = self._act("快捷键说明", self.show_shortcuts, shortcut="F1")
         self.act_autosave = self._act("自动保存 (每 2 分钟)", self._toggle_autosave, checkable=True)
         self.act_autosave.setChecked(self.settings.value("autosave", False, type=bool))
+        self.act_cycle_theme = self._act(
+            "循环切换主题",
+            self.cycle_theme,
+            shortcut="Ctrl+Shift+Y",
+            tip="在全部主题之间依次切换",
+        )
 
     # ==================================================================================
     # 构建: 界面
@@ -422,8 +428,7 @@ class MainWindow(QMainWindow):
         sidebar_menu.addAction(self.act_sidebar_tags)
         sidebar_menu.addAction(self.act_sidebar_stats)
         theme_menu = view_menu.addMenu("主题")
-        theme_menu.addAction(self.act_dark_theme)
-        theme_menu.addAction(self.act_light_theme)
+        self._build_theme_menu(theme_menu)
         view_menu.addSeparator()
         view_menu.addAction(self.act_autosave)
 
@@ -1365,18 +1370,59 @@ class MainWindow(QMainWindow):
     # ==================================================================================
     # 主题 / 其它
     # ==================================================================================
+    def _build_theme_menu(self, menu: QMenu) -> None:
+        """按 THEMES 注册表生成主题菜单 (单选), 新增主题无需改这里。"""
+        self._theme_actions: Dict[str, QAction] = {}
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        for key, label in theme_names():
+            theme = get_theme(key)
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(key == self.theme.key)
+            action.setToolTip(
+                f"{label} · {'深色' if theme.is_dark else '浅色'} · 主色 {theme.accent}"
+            )
+            action.triggered.connect(lambda _checked=False, k=key: self.set_theme_key(k))
+            self._theme_group.addAction(action)
+            menu.addAction(action)
+            self._theme_actions[key] = action
+        menu.addSeparator()
+        menu.addAction(self.act_cycle_theme)
+
+    def cycle_theme(self) -> None:
+        """在全部主题间循环切换 (Ctrl+Shift+Y)。"""
+        keys = list(self._theme_actions.keys()) or [t.key for t in THEMES.values()]
+        current = self.theme.key
+        index = keys.index(current) if current in keys else -1
+        self.set_theme_key(keys[(index + 1) % len(keys)])
+
     def set_theme_key(self, key: str) -> None:
         self.theme = get_theme(key)
         app = QApplication.instance()
         if app is not None:
             apply_theme(app, self.theme)
+        self.restyle()
+        self.settings.setValue("theme", self.theme.key)
+
+        action = getattr(self, "_theme_actions", {}).get(self.theme.key)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
+
+        self.set_status(f"已切换到 {self.theme.label}")
+
+    def restyle(self) -> None:
+        """只按当前主题刷新自绘控件, **不重建数据与页面**。
+
+        切换主题时没有必要重查条目、重建列表与详情页 —— 那既慢又会产生大量
+        待销毁的控件。这里只更新各面板持有的 ``_theme`` 与需要重新生成的 HTML。
+        """
         self.entry_list.set_theme(self.theme)
         self.detail_panel.set_theme(self.theme)
         self.history_panel.set_theme(self.theme)
         self.tag_panel.set_theme(self.theme)
-        self.settings.setValue("theme", key)
-        self.refresh_all(select_id=self._current_entry_id)
-        self.set_status(f"已切换到 {self.theme.label}")
+        self.refresh_stats()      # 统计面板是 HTML, 颜色写死在文本里, 必须重生成
+        self.update_titles()
 
     def _toggle_autosave(self, enabled: bool) -> None:
         self.settings.setValue("autosave", bool(enabled))
@@ -1396,9 +1442,11 @@ class MainWindow(QMainWindow):
         AboutDialog(self).exec()
 
     def show_shortcuts(self) -> None:
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        from PySide6.QtWidgets import QDialogButtonBox
 
-        dialog = QDialog(self)
+        from .native import ThemedDialog
+
+        dialog = ThemedDialog(self)
         dialog.setWindowTitle("快捷键与检索语法")
         dialog.setMinimumSize(560, 480)
         layout = QVBoxLayout(dialog)
@@ -1417,6 +1465,7 @@ class MainWindow(QMainWindow):
   Ctrl+Shift+C      复制当前实现代码  Ctrl+Shift+M  复制条目为 Markdown
   F5                刷新              Ctrl+滚轮     缩放代码字号
   Ctrl+1 / Ctrl+2   切换侧边栏 (标签 / 统计)
+  Ctrl+Shift+Y      循环切换主题 (5 套配色)
   F1                本帮助
 
 检索语法 (检索框中直接输入)
@@ -1479,6 +1528,13 @@ class MainWindow(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
         self.settings.setValue("mainSplitter", self.main_splitter.sizes())
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 原生标题栏不受样式表控制, 需要在窗口出现后单独染色 (否则深色主题顶部会留白框)
+        from .native import apply_titlebar_theme
+
+        apply_titlebar_theme(self, self.theme)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if not self._confirm_discard():

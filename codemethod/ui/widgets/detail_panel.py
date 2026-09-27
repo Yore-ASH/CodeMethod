@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QApplication,
@@ -292,12 +292,23 @@ class DetailPanel(QWidget):
     def _clear_tabs(self) -> None:
         self._previews.clear()
         self._impl_ids.clear()
+        removed = 0
         while self.tabs.count():
             widget = self.tabs.widget(0)
             self.tabs.removeTab(0)
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
+            if widget is None:
+                continue
+            # 注意: 不要 setParent(None) —— 那会把废弃的页签**提升为顶层窗口**,
+            # 之后每次全应用重刷样式都要连它一起算。
+            # removeTab 只是把页签从标签栏摘掉, 控件仍是 tab widget 的子控件。
+            widget.hide()
+            widget.deleteLater()
+            removed += 1
+        if removed:
+            # deleteLater() 只是投递一个 DeferredDelete 事件, 而 processEvents()
+            # **不会**处理它 —— 不显式冲刷的话, 这些页面会一直挂在 tab widget 下面,
+            # 反复切换主题/条目时控件数持续增长, 每次全应用重刷都越来越慢。
+            QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def _build_overview(self, entry: Entry) -> QWidget:
         scroll = QScrollArea(self.tabs)
@@ -574,12 +585,15 @@ class DetailPanel(QWidget):
             self.tabs.setCurrentIndex(index)
 
     def set_theme(self, theme: Theme) -> None:
+        """只更换配色与预览字体; 不做整页重建。
+
+        真正的重建由 ``MainWindow.set_theme_key() -> refresh_all()`` 统一触发,
+        这里再重建一次纯属浪费 (每次重建都要为所有实现重新创建高亮器)。
+        """
         self._theme = theme
         self._status_badge._theme = theme
         for preview in self._previews:
             preview.editor.set_theme(theme)
-        if self._entry is not None:
-            self.set_entry(self._entry, tag_colors=self._tag_colors)
 
 
 __all__ = ["DetailPanel", "StatusBadge"]

@@ -10,9 +10,10 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QTextBrowser, Q
 from ... import APP_NAME, APP_VERSION
 from ...core.languages import all_languages
 from ...storage.container import BINARY_EXTENSIONS, TEXT_EXTENSIONS, FORMAT_MAJOR, FORMAT_MINOR
+from ..native import ThemedDialog
 
 
-class AboutDialog(QDialog):
+class AboutDialog(ThemedDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"关于 {APP_NAME}")

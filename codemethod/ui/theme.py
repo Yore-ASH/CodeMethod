@@ -105,6 +105,11 @@ class Theme:
     mono_font_family: str = "Consolas"
     mono_font_size: int = 11
 
+    @property
+    def is_dark(self) -> bool:
+        """是否深色主题 (用于决定原生标题栏用深色还是浅色)。"""
+        return QColor(self.window).lightness() < 128
+
 
 DARK_PLUS = Theme()
 
@@ -176,7 +181,237 @@ LIGHT = Theme(
     diff_del_text="#CB2431",
 )
 
-THEMES: Dict[str, Theme] = {DARK_PLUS.key: DARK_PLUS, LIGHT.key: LIGHT}
+
+# --------------------------------------------------------------------------------------
+# 深海 (Deep Sea) —— 近乎黑的深蓝, 灵感来自深海与深海探测器仪表盘
+# --------------------------------------------------------------------------------------
+
+DEEP_SEA = Theme(
+    key="deep-sea",
+    label="深海 (Deep Sea)",
+    window="#04121C",
+    window_border="#0C2A3A",
+    sidebar="#071C28",
+    sidebar_section="#0A2534",
+    activity_bar="#05161F",
+    title_bar="#0A2230",
+    panel="#04121C",
+    panel_border="#0C2A3A",
+    status_bar="#0F6E7E",
+    status_bar_text="#EAFBFF",
+    editor="#05161F",
+    editor_gutter="#05161F",
+    editor_current_line="#0B2634",
+    editor_selection="#15485F",
+    editor_indent_guide="#123243",
+    tab_active="#05161F",
+    tab_inactive="#08202C",
+    menu="#071C28",
+    tooltip="#0A2534",
+    text="#BCD9E6",
+    text_muted="#6A93A6",
+    text_dim="#4C6E80",
+    text_bright="#EAF8FF",
+    accent="#1F9FBE",
+    accent_hover="#2BB8D8",
+    accent_dim="#0E3B4D",
+    button="#12657A",
+    button_hover="#17829C",
+    input_bg="#0A2230",
+    input_border="#12384A",
+    input_focus_border="#2BB8D8",
+    list_hover="#0B2C3C",
+    list_selected="#0F4A61",
+    list_selected_inactive="#123243",
+    scrollbar="#17414F",
+    scrollbar_hover="#1F5768",
+    border="#0C2A3A",
+    divider="#123243",
+    success="#4FD1C5",
+    warning="#E8D48B",
+    danger="#FF7B72",
+    info="#5BC8E8",
+    tok_comment="#4F7F72",
+    tok_keyword="#5BC8E8",
+    tok_control="#C792EA",
+    tok_type="#4FD1C5",
+    tok_function="#E8D48B",
+    tok_string="#E8A87C",
+    tok_number="#A8E6A3",
+    tok_constant="#7FD1FF",
+    tok_builtin="#E8D48B",
+    tok_preprocessor="#C792EA",
+    tok_annotation="#E8D48B",
+    tok_variable="#9FD8EF",
+    tok_operator="#BCD9E6",
+    tok_tag="#5BC8E8",
+    tok_attribute="#9FD8EF",
+    tok_key="#9FD8EF",
+    tok_error="#FF7B72",
+    diff_add_bg="#0B3327",
+    diff_del_bg="#3A1620",
+    diff_hunk_bg="#0F3B4D",
+    diff_add_text="#7FE0A8",
+    diff_del_text="#FF9C93",
+)
+
+
+# --------------------------------------------------------------------------------------
+# VSCode Red —— 经典 Dark+ 的底子, 把状态栏/强调色/选中态换成红色系
+# --------------------------------------------------------------------------------------
+
+VSCODE_RED = Theme(
+    key="vscode-red",
+    label="VSCode Red",
+    window="#1E1E1E",
+    window_border="#3C3C3C",
+    sidebar="#252526",
+    sidebar_section="#2D2D30",
+    activity_bar="#333333",
+    title_bar="#3C3C3C",
+    panel="#1E1E1E",
+    panel_border="#4A3535",
+    status_bar="#A01D1D",
+    status_bar_text="#FFFFFF",
+    editor="#1E1E1E",
+    editor_gutter="#1E1E1E",
+    editor_current_line="#2A2323",
+    editor_selection="#6B2020",
+    editor_indent_guide="#4A3838",
+    tab_active="#1E1E1E",
+    tab_inactive="#2D2D2D",
+    menu="#252526",
+    tooltip="#252526",
+    text="#D4D4D4",
+    text_muted="#9A8A8A",
+    text_dim="#6A5A5A",
+    text_bright="#FFFFFF",
+    accent="#C9403A",
+    accent_hover="#E05A52",
+    accent_dim="#5A1E1E",
+    button="#A1260D",
+    button_hover="#C42B1C",
+    input_bg="#3C3C3C",
+    input_border="#3C3C3C",
+    input_focus_border="#E05A52",
+    list_hover="#3A2A2A",
+    list_selected="#5A1E1E",
+    list_selected_inactive="#3A2A2A",
+    scrollbar="#4A3A3A",
+    scrollbar_hover="#5A4747",
+    border="#3C3C3C",
+    divider="#4A3535",
+    success="#4EC9B0",
+    warning="#DCDCAA",
+    danger="#F14C4C",
+    info="#569CD6",
+    tok_comment="#6A9955",
+    tok_keyword="#569CD6",
+    tok_control="#C586C0",
+    tok_type="#4EC9B0",
+    tok_function="#DCDCAA",
+    tok_string="#CE9178",
+    tok_number="#B5CEA8",
+    tok_constant="#4FC1FF",
+    tok_builtin="#DCDCAA",
+    tok_preprocessor="#C586C0",
+    tok_annotation="#DCDCAA",
+    tok_variable="#9CDCFE",
+    tok_operator="#D4D4D4",
+    tok_tag="#569CD6",
+    tok_attribute="#9CDCFE",
+    tok_key="#9CDCFE",
+    tok_error="#F44747",
+    diff_add_bg="#1E3A1E",
+    diff_del_bg="#3A1E1E",
+    diff_hunk_bg="#5A1E1E",
+    diff_add_text="#B5CEA8",
+    diff_del_text="#F14C4C",
+)
+
+
+# --------------------------------------------------------------------------------------
+# Dracula —— 深紫夜色, 对比度高, 长时间阅读代码不累
+# --------------------------------------------------------------------------------------
+
+DRACULA = Theme(
+    key="dracula",
+    label="Dracula (紫夜)",
+    window="#282A36",
+    window_border="#191A21",
+    sidebar="#21222C",
+    sidebar_section="#2C2E3E",
+    activity_bar="#21222C",
+    title_bar="#21222C",
+    panel="#282A36",
+    panel_border="#44475A",
+    status_bar="#6272A4",
+    status_bar_text="#F8F8F2",
+    editor="#282A36",
+    editor_gutter="#282A36",
+    editor_current_line="#44475A",
+    editor_selection="#4A4E69",
+    editor_indent_guide="#3C3F52",
+    tab_active="#282A36",
+    tab_inactive="#21222C",
+    menu="#21222C",
+    tooltip="#21222C",
+    text="#F8F8F2",
+    text_muted="#B0B4C9",
+    text_dim="#6272A4",
+    text_bright="#FFFFFF",
+    accent="#BD93F9",
+    accent_hover="#CBA9FF",
+    accent_dim="#463A63",
+    button="#6B4FA8",
+    button_hover="#8360C9",
+    input_bg="#21222C",
+    input_border="#44475A",
+    input_focus_border="#BD93F9",
+    list_hover="#343746",
+    list_selected="#44475A",
+    list_selected_inactive="#343746",
+    scrollbar="#44475A",
+    scrollbar_hover="#5A5E75",
+    border="#191A21",
+    divider="#44475A",
+    success="#50FA7B",
+    warning="#F1FA8C",
+    danger="#FF5555",
+    info="#8BE9FD",
+    tok_comment="#6272A4",
+    tok_keyword="#FF79C6",
+    tok_control="#FF79C6",
+    tok_type="#8BE9FD",
+    tok_function="#50FA7B",
+    tok_string="#F1FA8C",
+    tok_number="#BD93F9",
+    tok_constant="#BD93F9",
+    tok_builtin="#8BE9FD",
+    tok_preprocessor="#FF79C6",
+    tok_annotation="#50FA7B",
+    tok_variable="#F8F8F2",
+    tok_operator="#FF79C6",
+    tok_tag="#FF79C6",
+    tok_attribute="#50FA7B",
+    tok_key="#8BE9FD",
+    tok_error="#FF5555",
+    diff_add_bg="#2A4A34",
+    diff_del_bg="#4A2A34",
+    diff_hunk_bg="#44475A",
+    diff_add_text="#50FA7B",
+    diff_del_text="#FF5555",
+)
+
+
+# 顺序即"视图 → 主题"菜单里的顺序
+THEMES: Dict[str, Theme] = {
+    DARK_PLUS.key: DARK_PLUS,
+    DEEP_SEA.key: DEEP_SEA,
+    VSCODE_RED.key: VSCODE_RED,
+    DRACULA.key: DRACULA,
+    LIGHT.key: LIGHT,
+}
 DEFAULT_THEME = DARK_PLUS
 
 
@@ -185,6 +420,7 @@ def get_theme(key: Optional[str]) -> Theme:
 
 
 def theme_names() -> List[tuple]:
+    """``[(key, 显示名), ...]``, 供主题菜单使用。"""
     return [(t.key, t.label) for t in THEMES.values()]
 
 
@@ -563,9 +799,40 @@ QTextBrowser, QTextEdit#DiffView, QPlainTextEdit#DiffView {{
 """
 
 
-def apply_theme(app: QApplication, theme: Theme = DEFAULT_THEME) -> None:
-    """把主题应用到整个应用 (样式表 + 调色板)。"""
-    app.setStyle("Fusion")
+# 已应用到应用的样式/主题。用于让重复调用 apply_theme 变成一次廉价的短路 ——
+# setStyle() 与 setStyleSheet() 都会触发**全应用**重新计算样式, 代价随存活控件数增长。
+_style_installed = False
+_applied_theme_key: Optional[str] = None
+
+
+def current_applied_theme_key() -> Optional[str]:
+    """最近一次真正应用到 QApplication 的主题 key (未应用过则为 None)。"""
+    return _applied_theme_key
+
+
+def apply_theme(app: QApplication, theme: Theme = DEFAULT_THEME, *, force: bool = False) -> None:
+    """把主题应用到整个应用 (样式表 + 调色板 + 原生标题栏)。
+
+    重复传入**同一个**主题时会直接短路: 全应用重新计算样式非常昂贵
+    (``setStyle`` 与 ``setStyleSheet`` 各自会触发一次), 而 ``MainWindow`` 每次构造
+    都会走一遍这条路径, 不短路的话开一个窗口就要几秒。
+    确实需要强制重刷时传 ``force=True``。
+    """
+    global _style_installed, _applied_theme_key
+
+    if not _style_installed:
+        app.setStyle("Fusion")
+        _style_installed = True
+
+    # 原生标题栏不会随样式表变化, 必须单独通过 DWM 染色, 否则深色主题顶部会是一条白框。
+    # 这一步很便宜, 即使主题没变也执行, 保证新窗口能被正确着色。
+    from .native import install_titlebar_themer
+
+    install_titlebar_themer(app, theme)
+
+    if not force and _applied_theme_key == theme.key:
+        return
+
     app.setStyleSheet(_qss(theme))
     app.setFont(ui_font())
 
@@ -583,6 +850,7 @@ def apply_theme(app: QApplication, theme: Theme = DEFAULT_THEME) -> None:
     palette.setColor(QPalette.ColorRole.ToolTipText, QColor(theme.text))
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(theme.text_dim))
     app.setPalette(palette)
+    _applied_theme_key = theme.key
 
 
 def token_colors(theme: Theme = DEFAULT_THEME) -> Dict[str, str]:

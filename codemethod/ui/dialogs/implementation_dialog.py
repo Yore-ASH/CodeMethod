@@ -20,11 +20,12 @@ from PySide6.QtWidgets import (
 
 from ...core.languages import default_filename, get_language, language_choices
 from ...core.models import Entry, Implementation
+from ..native import ThemedDialog
 from ..theme import DEFAULT_THEME, Theme
 from .entry_editor import ImplementationEditor
 
 
-class ImplementationDialog(QDialog):
+class ImplementationDialog(ThemedDialog):
     """新增 / 编辑条目下的**一个**语言实现。"""
 
     def __init__(

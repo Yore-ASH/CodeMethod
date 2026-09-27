@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codemethod"
-version = "1.1.0"
+version = "1.2.0"
 description = "多标签代码实现规划与知识库 — 记录、标注、多语言实现、全量历史回滚的 PySide6 桌面工具"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -12,8 +12,8 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.*=false")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from PySide6.QtCore import qInstallMessageHandler
-    from PySide6.QtGui import QTextDocument
+    from PySide6.QtCore import QSettings, qInstallMessageHandler
+    from PySide6.QtGui import QColor, QTextDocument
     from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
     qInstallMessageHandler(lambda *args: None)
@@ -24,8 +24,14 @@ try:
     from codemethod.ui.editor import CodeEditor, CodePreview, DiffView
     from codemethod.ui.highlighter import build_rules, highlighted_tokens
     from codemethod.ui.main_window import MainWindow
-    from codemethod.ui.theme import DARK_PLUS, LIGHT, apply_theme, get_theme, mono_font
-
+    from codemethod.ui.theme import (
+        DARK_PLUS,
+        DEFAULT_THEME,
+        LIGHT,
+        apply_theme,
+        get_theme,
+        mono_font,
+    )
     PYSIDE = True
 except Exception as exc:  # pragma: no cover - 环境缺少 PySide6 时跳过
     PYSIDE = False
@@ -63,13 +69,17 @@ class _TrackedWidgets(unittest.TestCase):
 
     def setUp(self):
         self._tracked: list = []
+        # 主题是持久化设置: 上一个测试留下的选择会让后面的窗口构造走另一条路径,
+        # 既拖慢套件也破坏可复现性, 所以每个用例开始前清掉。
+        self.app.processEvents()
+        QSettings("CodeMethod", "CodeMethod").remove("theme")
 
     def tearDown(self):
         while self._tracked:
             widget = self._tracked.pop()
             try:
                 widget.close()          # 触发 closeEvent, 让窗口进入 teardown 状态并断开信号
-                widget.setParent(None)
+                # 不要 setParent(None): 那会把控件提升为顶层窗口, 拖慢后续的全应用样式重刷
                 widget.deleteLater()
             except RuntimeError:  # 已被 C++ 侧回收
                 pass
@@ -80,6 +90,17 @@ class _TrackedWidgets(unittest.TestCase):
         """登记部件, 测试结束统一销毁。"""
         self._tracked.append(widget)
         return widget
+
+    def _window(self):
+        """通用夹具: 一个含单语言实现的小库 + 主窗口。"""
+        db = Database(Repository(name="测试库"))
+        entry = db.repository.create_entry("题", "描述", "", ["t"])
+        db.repository.add_implementation(entry.id, "python", "print(1)")
+        window = self.track(MainWindow(db))
+        window.show()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        return window, db
 
 
 @unittest.skipUnless(PYSIDE, "需要 PySide6")
@@ -879,6 +900,200 @@ class TestPerLanguagePrerequisites(_TrackedWidgets):
         impl = restored.require(entry.id).active_implementations[0]
         self.assertEqual(impl.prerequisites, "")
         window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestThemes(_TrackedWidgets):
+    """主题系统: 注册表、明暗判定、对比度、菜单与切换。"""
+
+    def test_all_themes_registered(self):
+        from codemethod.ui.theme import THEMES, get_theme, theme_names
+
+        self.assertGreaterEqual(len(THEMES), 5)
+        keys = [key for key, _label in theme_names()]
+        for expected in ("dark+", "light", "deep-sea", "vscode-red", "dracula"):
+            self.assertIn(expected, keys, f"缺少主题 {expected}")
+        for key in keys:
+            self.assertEqual(get_theme(key).key, key)
+
+    def test_unknown_theme_falls_back(self):
+        self.assertEqual(get_theme("nope").key, "dark+")
+
+    def test_dark_flag_matches_window_color(self):
+        from codemethod.ui.theme import THEMES
+
+        expected = {
+            "dark+": True,
+            "deep-sea": True,
+            "vscode-red": True,
+            "dracula": True,
+            "light": False,
+        }
+        for key, is_dark in expected.items():
+            self.assertEqual(THEMES[key].is_dark, is_dark, key)
+
+    def test_light_theme_has_light_title_bar_and_dark_ones_dark(self):
+        """原生标题栏靠 is_dark 决定明暗, 判定错了顶部就会突兀。"""
+        from codemethod.ui.theme import THEMES
+
+        self.assertFalse(THEMES["light"].is_dark)
+        self.assertTrue(all(THEMES[k].is_dark for k in ("dark+", "deep-sea", "vscode-red", "dracula")))
+
+    # ---- 对比度: 防止出现看不清的主题 ----
+
+    @staticmethod
+    def _contrast(a: str, b: str) -> float:
+        def luminance(color: str) -> float:
+            c = QColor(color)
+            channels = []
+            for value in (c.redF(), c.greenF(), c.blueF()):
+                channels.append(value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4)
+            return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+        high, low = sorted((luminance(a), luminance(b)), reverse=True)
+        return (high + 0.05) / (low + 0.05)
+
+    def test_body_text_is_readable_on_every_theme(self):
+        from codemethod.ui.theme import THEMES
+
+        for key, theme in THEMES.items():
+            for surface in ("window", "editor", "sidebar"):
+                ratio = self._contrast(theme.text, getattr(theme, surface))
+                self.assertGreaterEqual(
+                    ratio, 4.5, f"{key} 的正文在 {surface} 上对比度只有 {ratio:.2f}"
+                )
+
+    def test_token_colors_are_readable(self):
+        from codemethod.ui.theme import THEMES
+
+        token_fields = [
+            "tok_comment", "tok_keyword", "tok_control", "tok_type", "tok_function",
+            "tok_string", "tok_number", "tok_constant", "tok_builtin", "tok_variable",
+        ]
+        for key, theme in THEMES.items():
+            for field in token_fields:
+                ratio = self._contrast(getattr(theme, field), theme.editor)
+                self.assertGreaterEqual(
+                    ratio, 2.5, f"{key} 的 {field} 在编辑器背景上对比度只有 {ratio:.2f}"
+                )
+
+    def test_status_bar_text_is_readable(self):
+        from codemethod.ui.theme import THEMES
+
+        for key, theme in THEMES.items():
+            ratio = self._contrast(theme.status_bar_text, theme.status_bar)
+            self.assertGreaterEqual(ratio, 3.0, f"{key} 状态栏文字对比度只有 {ratio:.2f}")
+
+    def test_stylesheet_is_generated_for_every_theme(self):
+        from codemethod.ui.theme import THEMES, _qss
+
+        for key, theme in THEMES.items():
+            sheet = _qss(theme)
+            self.assertIn(theme.window, sheet, key)
+            self.assertIn(theme.accent, sheet, key)
+            # 大括号必须成对, 否则整份样式表会失效
+            self.assertEqual(sheet.count("{"), sheet.count("}"), f"{key} 的 QSS 花括号不配对")
+
+    # ---- 切换 ----
+
+    def test_switching_every_theme_updates_window(self):
+        from codemethod.ui.theme import THEMES
+
+        window, _db = self._window()
+        for key in THEMES:
+            window.set_theme_key(key)
+            self.app.processEvents()
+            self.assertEqual(window.theme.key, key)
+            self.assertEqual(window.detail_panel._theme.key, key)
+            self.assertEqual(window.entry_list._theme.key, key)
+            self.assertEqual(window.history_panel._theme.key, key)
+            self.assertEqual(window.tag_panel._theme.key, key)
+        window.close()
+
+    def test_theme_menu_has_one_checked_action(self):
+        from codemethod.ui.theme import THEMES
+
+        window, _db = self._window()
+        self.assertEqual(len(window._theme_actions), len(THEMES))
+        for key in THEMES:
+            window.set_theme_key(key)
+            self.app.processEvents()
+            checked = [k for k, a in window._theme_actions.items() if a.isChecked()]
+            self.assertEqual(checked, [key], f"切到 {key} 后勾选状态不对: {checked}")
+        window.close()
+
+    def test_cycle_theme_visits_every_theme(self):
+        from codemethod.ui.theme import THEMES
+
+        window, _db = self._window()
+        start = window.theme.key
+        seen = []
+        for _ in range(len(THEMES)):
+            window.cycle_theme()
+            seen.append(window.theme.key)
+        self.assertEqual(sorted(seen), sorted(THEMES.keys()))
+        self.assertEqual(window.theme.key, start)  # 转一圈回到原点
+        window.close()
+
+    def test_theme_choice_is_persisted(self):
+        window, _db = self._window()
+        window.set_theme_key("deep-sea")
+        self.assertEqual(window.settings.value("theme", "", type=str), "deep-sea")
+        window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestNativeTitleBar(_TrackedWidgets):
+    """原生标题栏着色: 深色主题不能留一条白框。"""
+
+    def test_apply_returns_bool_and_never_raises(self):
+        from codemethod.ui.native import apply_titlebar_theme
+        from codemethod.ui.theme import get_theme
+
+        window, _db = self._window()
+        for key in ("dark+", "light", "deep-sea"):
+            result = apply_titlebar_theme(window, get_theme(key))
+            self.assertIsInstance(result, bool)
+            self.app.processEvents()
+        window.close()
+
+    def test_apply_on_none_is_safe(self):
+        from codemethod.ui.native import apply_titlebar_theme
+
+        self.assertFalse(apply_titlebar_theme(None, DEFAULT_THEME))  # type: ignore[arg-type]
+
+    def test_colorref_conversion(self):
+        """Win32 的 COLORREF 是 0x00BBGGRR, 顺序写反了标题栏颜色就会错。"""
+        from codemethod.ui.native import _colorref
+
+        self.assertEqual(_colorref("#000000"), 0x000000)
+        self.assertEqual(_colorref("#FFFFFF"), 0xFFFFFF)
+        # 纯红 #FF0000 -> B=00 G=00 R=FF -> 0x0000FF
+        self.assertEqual(_colorref("#FF0000"), 0x0000FF)
+        # 纯蓝 #0000FF -> B=FF G=00 R=00 -> 0xFF0000
+        self.assertEqual(_colorref("#0000FF"), 0xFF0000)
+
+    def test_themer_is_installed_by_apply_theme(self):
+        from codemethod.ui.native import current_themer
+        from codemethod.ui.theme import apply_theme, get_theme
+
+        apply_theme(self.app, get_theme("deep-sea"))
+        themer = current_themer()
+        self.assertIsNotNone(themer)
+        self.assertEqual(themer.theme.key, "deep-sea")
+
+        # 再切一次应该复用同一个实例, 而不是重复安装事件过滤器
+        apply_theme(self.app, get_theme("light"))
+        self.assertIs(current_themer(), themer)
+        self.assertEqual(themer.theme.key, "light")
+
+    def test_themer_tracks_dark_flag_of_each_theme(self):
+        from codemethod.ui.native import current_themer
+        from codemethod.ui.theme import THEMES, apply_theme, get_theme
+
+        for key, theme in THEMES.items():
+            apply_theme(self.app, get_theme(key))
+            self.assertEqual(current_themer().theme.is_dark, theme.is_dark, key)
 
 
 if __name__ == "__main__":

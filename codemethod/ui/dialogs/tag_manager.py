@@ -25,10 +25,11 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.repository import Repository
+from ..native import ThemedDialog
 from ..theme import DEFAULT_THEME, Theme
 
 
-class TagManagerDialog(QDialog):
+class TagManagerDialog(ThemedDialog):
     """标签管理中心。
 
     所有操作都通过 :class:`~codemethod.core.repository.Repository` 执行,
