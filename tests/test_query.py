@@ -142,6 +142,65 @@ class QueryTestCase(unittest.TestCase):
         self.assertIn("标签", QuerySpec(tags=["a"], tag_mode=TagMatch.ALL).describe())
 
 
+class TestPrerequisitesSearch(unittest.TestCase):
+    """前置要求是分语言的, prereq: 必须能同时搜到通用与各语言的。"""
+
+    def setUp(self):
+        self.repo = Repository(name="p")
+        self.entry = self.repo.create_entry("题", "d", "需要理解双向链表", ["t"])
+        self.repo.add_implementation(
+            self.entry.id, "rust", "fn main(){}", prerequisites="Rust 1.75+, cargo"
+        )
+        self.repo.add_implementation(
+            self.entry.id, "python", "print(1)", prerequisites="Python 3.10+"
+        )
+        self.other = self.repo.create_entry("别的题", "d", "", [])
+        self.repo.add_implementation(self.other.id, "go", "package main", prerequisites="Go 1.21+")
+
+    def find(self, term):
+        return {e.id for e in query_entries(self.repo, QuerySpec(text=term))}
+
+    def test_matches_shared_prerequisites(self):
+        self.assertEqual(self.find("prereq:双向链表"), {self.entry.id})
+
+    def test_matches_per_language_prerequisites(self):
+        self.assertEqual(self.find("prereq:cargo"), {self.entry.id})
+        self.assertEqual(self.find("prereq:3.10"), {self.entry.id})
+        self.assertEqual(self.find("prereq:1.21"), {self.other.id})
+
+    def test_distinguishes_languages(self):
+        # 注意: prereq: 是子串匹配, "go" 会命中 "cargo", 所以用完整版本号来区分
+        self.assertEqual(self.find("prereq:rust 1.75"), {self.entry.id})
+        self.assertEqual(self.find("prereq:go 1.21"), {self.other.id})
+        self.assertEqual(self.find("prereq:python"), {self.entry.id})
+
+    def test_no_match(self):
+        self.assertEqual(self.find("prereq:完全不存在的东西"), set())
+
+    def test_negation(self):
+        self.assertEqual(self.find("-prereq:cargo"), {self.other.id})
+
+    def test_chinese_alias(self):
+        self.assertEqual(self.find("前置:cargo"), {self.entry.id})
+
+    def test_plain_search_also_finds_them(self):
+        self.assertEqual(self.find("cargo"), {self.entry.id})
+
+    def test_empty_prerequisites_do_not_match(self):
+        repo = Repository(name="p2")
+        plain = repo.create_entry("无前置", "", "", [])
+        repo.add_implementation(plain.id, "go", "package main")
+        self.assertEqual(
+            {e.id for e in query_entries(repo, QuerySpec(text="prereq:需要 gcc"))}, set()
+        )
+
+    def test_substring_semantics(self):
+        """prereq: 是子串匹配 —— 记录这个已知行为, 避免被当成 bug。"""
+        self.assertEqual(self.find("prereq:cargo"), {self.entry.id})
+        # "go" 是 "cargo" 的子串, 因此也会命中
+        self.assertIn(self.entry.id, self.find("prereq:go"))
+
+
 class TestSorting(unittest.TestCase):
     def setUp(self):
         self.repo = Repository(name="s")

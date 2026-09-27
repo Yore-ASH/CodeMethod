@@ -94,13 +94,22 @@ def entry_to_markdown(entry: Entry, *, revisions: Optional[List[Revision]] = Non
     lines.append(entry.description.strip() or "_（未填写）_")
     lines.append("")
 
-    lines.append("## 前置要求")
+    lines.append("## 通用前置要求")
     lines.append("")
     lines.append(entry.prerequisites.strip() or "_（未填写）_")
     lines.append("")
 
     lines.append(f"## 实现 ({len(entry.active_implementations)} 种语言)")
     lines.append("")
+    # 先给一张"每种语言各自需要什么"的对照表 —— 前置要求是分语言的
+    if entry.active_implementations:
+        lines.append("| 语言 | 前置要求 |")
+        lines.append("| --- | --- |")
+        for impl in entry.active_implementations:
+            need = impl.prerequisites.strip().replace("\n", " ").replace("|", "\\|") or "—"
+            lines.append(f"| {get_language(impl.language).name} | {need} |")
+        lines.append("")
+
     for impl in entry.active_implementations:
         spec = get_language(impl.language)
         heading = f"### {spec.name}"
@@ -111,6 +120,8 @@ def entry_to_markdown(entry: Entry, *, revisions: Optional[List[Revision]] = Non
         if impl.filename:
             lines.append(f"文件: `{impl.filename}`")
             lines.append("")
+        lines.append("**前置要求**: " + (impl.prerequisites.strip() or "_（未填写）_"))
+        lines.append("")
         if impl.notes:
             lines.append(f"> {impl.notes}")
             lines.append("")

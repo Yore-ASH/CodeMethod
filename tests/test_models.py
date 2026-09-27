@@ -103,6 +103,60 @@ class TestModels(unittest.TestCase):
         self.assertEqual(restored.id, impl.id)
         self.assertEqual(restored.line_count, 1)
 
+    def test_implementation_carries_its_own_prerequisites(self):
+        """前置要求是分语言的: 每种实现各存一份。"""
+        py = Implementation(language="python", prerequisites="Python 3.10+")
+        go = Implementation(language="go", prerequisites="Go 1.21+")
+        self.assertEqual(py.prerequisites, "Python 3.10+")
+        self.assertEqual(go.prerequisites, "Go 1.21+")
+        self.assertNotEqual(py.prerequisites, go.prerequisites)
+
+        restored = Implementation.from_dict(py.to_dict())
+        self.assertEqual(restored.prerequisites, "Python 3.10+")
+
+    def test_implementation_prerequisites_defaults_to_empty(self):
+        """旧数据没有该字段时应安全读成空串 (向后兼容)。"""
+        legacy = {
+            "id": "impl_old",
+            "language": "python",
+            "code": "x = 1",
+            "title": "",
+            "filename": "main.py",
+            "notes": "",
+        }
+        impl = Implementation.from_dict(legacy)
+        self.assertEqual(impl.prerequisites, "")
+        self.assertEqual(impl.to_dict()["prerequisites"], "")
+
+    def test_clone_keeps_prerequisites(self):
+        impl = Implementation(language="rust", prerequisites="Rust 1.75+ / cargo")
+        self.assertEqual(impl.clone().prerequisites, "Rust 1.75+ / cargo")
+        self.assertEqual(impl.clone(new_identity=True).prerequisites, "Rust 1.75+ / cargo")
+
+    def test_entry_prerequisites_by_language(self):
+        entry = Entry(
+            title="x",
+            prerequisites="通用要求",
+            implementations=[
+                Implementation(language="python", prerequisites="Python 3.10+"),
+                Implementation(language="go", prerequisites=""),
+                Implementation(language="rust", prerequisites="cargo"),
+                Implementation(language="c", prerequisites="GCC", deleted=True),
+            ],
+        )
+        pairs = entry.prerequisites_by_language
+        self.assertEqual(len(pairs), 3)          # 已删除的不算
+        self.assertEqual(pairs[0], ("Python", "Python 3.10+"))
+        self.assertEqual(pairs[1], ("Go", ""))
+        self.assertEqual(pairs[2], ("Rust", "cargo"))
+
+    def test_search_blob_includes_per_language_prerequisites(self):
+        entry = Entry(
+            title="x",
+            implementations=[Implementation(language="rust", prerequisites="需要 cargo")],
+        )
+        self.assertIn("cargo", entry.search_blob)
+
     def test_implementation_clone_new_identity(self):
         impl = Implementation(language="go", code="package main")
         clone = impl.clone(new_identity=True)

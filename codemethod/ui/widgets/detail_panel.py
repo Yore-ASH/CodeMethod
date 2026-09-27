@@ -326,13 +326,16 @@ class DetailPanel(QWidget):
 
         for impl in entry.active_implementations:
             line = QWidget(container)
-            line_layout = QHBoxLayout(line)
-            line_layout.setContentsMargins(0, 0, 0, 0)
-            line_layout.setSpacing(8)
+            # 竖向: 第一行是"语言 + 说明 + 操作", 第二行是该语言自己的前置要求
+            line_layout = QVBoxLayout(line)
+            line_layout.setContentsMargins(0, 0, 0, 2)
+            line_layout.setSpacing(2)
 
+            top = QHBoxLayout()
+            top.setSpacing(8)
             badge = QLabel(get_language(impl.language).name, line)
             badge.setObjectName("CountBadge")
-            line_layout.addWidget(badge)
+            top.addWidget(badge)
 
             describe = QLabel(
                 f"{impl.display_title} · {impl.filename} · {impl.line_count} 行"
@@ -341,13 +344,13 @@ class DetailPanel(QWidget):
             )
             describe.setObjectName("MutedLabel")
             describe.setWordWrap(True)
-            line_layout.addWidget(describe, 1)
+            top.addWidget(describe, 1)
 
             view = QPushButton("查看", line)
             view.setProperty("flat", True)
             view.setToolTip(f"跳到 {get_language(impl.language).name} 实现")
             view.clicked.connect(lambda _c=False, iid=impl.id: self.show_implementation(iid))
-            line_layout.addWidget(view)
+            top.addWidget(view)
 
             edit = QPushButton("编辑", line)
             edit.setProperty("flat", True)
@@ -355,7 +358,7 @@ class DetailPanel(QWidget):
             edit.clicked.connect(
                 lambda _c=False, iid=impl.id: self._emit_edit_implementation(iid)
             )
-            line_layout.addWidget(edit)
+            top.addWidget(edit)
 
             remove = QPushButton("删除", line)
             remove.setProperty("flat", True)
@@ -363,7 +366,19 @@ class DetailPanel(QWidget):
             remove.clicked.connect(
                 lambda _c=False, iid=impl.id: self._request_delete_implementation(iid)
             )
-            line_layout.addWidget(remove)
+            top.addWidget(remove)
+            line_layout.addLayout(top)
+
+            # 每种语言自己的前置要求 (前置要求是分语言的)
+            prerequisite = impl.prerequisites.strip()
+            prereq_label = QLabel(
+                f"　　前置要求: {prerequisite}" if prerequisite else "　　前置要求: （未填写）",
+                line,
+            )
+            prereq_label.setObjectName("MutedLabel" if prerequisite else "DimLabel")
+            prereq_label.setWordWrap(True)
+            prereq_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            line_layout.addWidget(prereq_label)
             layout.addWidget(line)
 
         if not entry.active_implementations:
@@ -380,7 +395,8 @@ class DetailPanel(QWidget):
         description.set_text(entry.description)
         layout.addWidget(description)
 
-        prerequisites = _MetaField("前置要求", container)
+        # 条目级: 与语言无关的通用前置要求
+        prerequisites = _MetaField("通用前置要求 (所有语言共用)", container)
         prerequisites.set_text(entry.prerequisites)
         layout.addWidget(prerequisites)
 
@@ -460,10 +476,12 @@ class DetailPanel(QWidget):
             )
             self._previews.append(preview)
             self._impl_ids.append(impl.id)
-            self.tabs.addTab(preview, impl.display_title)
+            page = self._wrap_implementation_tab(preview, impl)
+            self.tabs.addTab(page, impl.display_title)
             self.tabs.setTabToolTip(
                 self.tabs.count() - 1,
-                f"{get_language(impl.language).name} · {impl.filename} · {impl.line_count} 行",
+                f"{get_language(impl.language).name} · {impl.filename} · {impl.line_count} 行"
+                + (f"\n前置要求: {impl.prerequisites.strip()}" if impl.prerequisites.strip() else ""),
             )
 
         removed = [impl for impl in entry.implementations if impl.deleted]
@@ -485,6 +503,40 @@ class DetailPanel(QWidget):
 
     # ----------------------------------------------------------------------------
     # 操作
+    def _wrap_implementation_tab(self, preview: CodePreview, implementation) -> QWidget:
+        """给代码预览加一条"本语言前置要求"信息栏。
+
+        前置要求是分语言的, 所以放在每种语言自己的页签里, 打开就能看到。
+        """
+        prerequisite = implementation.prerequisites.strip()
+        if not prerequisite:
+            return preview
+
+        page = QWidget(self.tabs)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QWidget(page)
+        bar.setObjectName("CodeHeader")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(10, 4, 10, 4)
+        bar_layout.setSpacing(6)
+
+        title = QLabel(f"{get_language(implementation.language).name} 前置要求", bar)
+        title.setObjectName("SectionLabel")
+        bar_layout.addWidget(title)
+
+        text = QLabel(prerequisite, bar)
+        text.setObjectName("MutedLabel")
+        text.setWordWrap(True)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        bar_layout.addWidget(text, 1)
+
+        layout.addWidget(bar)
+        layout.addWidget(preview, 1)
+        return page
+
     # ----------------------------------------------------------------------------
     def _copy_all_code(self) -> None:
         if self._entry is None:

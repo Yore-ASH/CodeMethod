@@ -108,6 +108,67 @@ class TestImplementationCrud(RepositoryTestCase):
         with self.assertRaises(RepositoryError):
             self.repo.update_implementation(self.entry.id, "nope", code="x")
 
+    def test_each_language_keeps_its_own_prerequisites(self):
+        """同一个问题, 不同语言的前置要求互不干扰。"""
+        py = self.repo.add_implementation(
+            self.entry.id, "python", "print(1)", prerequisites="Python 3.10+"
+        )
+        go = self.repo.add_implementation(
+            self.entry.id, "go", "package main", prerequisites="Go 1.21+"
+        )
+        entry = self.repo.require(self.entry.id)
+        self.assertEqual(entry.get_implementation(py.id).prerequisites, "Python 3.10+")
+        self.assertEqual(entry.get_implementation(go.id).prerequisites, "Go 1.21+")
+        self.assertEqual(
+            entry.prerequisites_by_language,
+            [("Python", "Python 3.10+"), ("Go", "Go 1.21+")],
+        )
+
+    def test_updating_prerequisites_is_tracked_in_history(self):
+        impl = self.repo.add_implementation(self.entry.id, "python", "a")
+        self.repo.update_implementation(
+            self.entry.id, impl.id, prerequisites="Python 3.12+, 需要 aiohttp"
+        )
+        self.assertEqual(
+            self.repo.require(self.entry.id).get_implementation(impl.id).prerequisites,
+            "Python 3.12+, 需要 aiohttp",
+        )
+        self.assertIn("impl_update", self.actions())
+        # 摘要里要能看出改的是"前置要求"
+        latest = self.repo.revisions(self.entry.id)[0]
+        self.assertIn("前置要求", latest.summary)
+
+    def test_prerequisites_change_appears_in_diff(self):
+        impl = self.repo.add_implementation(
+            self.entry.id, "python", "a", prerequisites="Python 3.8+"
+        )
+        self.repo.update_implementation(self.entry.id, impl.id, prerequisites="Python 3.12+")
+        latest = self.repo.revisions(self.entry.id)[0]
+        diff = self.repo.revision_diff(latest.id)
+        self.assertIn("前置要求", diff)
+        self.assertIn("-Python 3.8+", diff)
+        self.assertIn("+Python 3.12+", diff)
+
+    def test_apply_entry_persists_per_language_prerequisites(self):
+        from codemethod.core.models import Implementation
+
+        implementations = [
+            Implementation(language="python", code="x", prerequisites="Python 3.10+"),
+            Implementation(language="go", code="y", prerequisites="Go 1.21+"),
+        ]
+        self.repo.apply_entry(self.entry.id, implementations=implementations)
+        entry = self.repo.require(self.entry.id)
+        self.assertEqual(
+            [i.prerequisites for i in entry.active_implementations],
+            ["Python 3.10+", "Go 1.21+"],
+        )
+        # 重新载入 (模拟存盘再打开) 后仍然保留
+        restored = Repository.from_dict(self.repo.to_dict())
+        self.assertEqual(
+            [i.prerequisites for i in restored.require(self.entry.id).active_implementations],
+            ["Python 3.10+", "Go 1.21+"],
+        )
+
     def test_delete_implementation_is_soft_and_tracked(self):
         impl = self.repo.add_implementation(self.entry.id, "python", "a")
         self.repo.delete_implementation(self.entry.id, impl.id)

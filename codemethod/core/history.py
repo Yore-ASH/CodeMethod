@@ -65,8 +65,17 @@ def _unified_diff(before: str, after: str, label: str, context: int = 3) -> List
 _TEXT_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("title", "标题"),
     ("description", "描述"),
-    ("prerequisites", "前置要求"),
+    ("prerequisites", "通用前置要求"),
     ("status", "状态"),
+)
+
+# 单个语言实现的元信息字段 (用于差异与摘要)
+_IMPL_META_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("language", "语言"),
+    ("title", "标题"),
+    ("filename", "文件名"),
+    ("notes", "备注"),
+    ("prerequisites", "前置要求"),
 )
 
 
@@ -135,19 +144,15 @@ def build_revision_diff(
             continue
 
         old_impl = old_impls[impl_id]
-        for field_name, field_label in (
-            ("title", "实现标题"),
-            ("filename", "文件名"),
-            ("notes", "备注"),
-            ("language", "语言"),
-        ):
+        for field_name, field_label in _IMPL_META_FIELDS:
             old_val = str(old_impl.get(field_name) or "")
             new_val = str(impl.get(field_name) or "")
-            if old_val != new_val:
-                chunks.append(f"### {label} · {field_label}")
-                chunks.append(f"-{old_val or '<空>'}")
-                chunks.append(f"+{new_val or '<空>'}")
-                chunks.append("")
+            if old_val == new_val:
+                continue
+            chunks.append(f"### {label} · {field_label}")
+            # 前置要求可能写成多行, 用统一差异而不是单行 +/-
+            chunks.extend(_unified_diff(old_val, new_val, f"{label} · {field_label}", context))
+            chunks.append("")
 
         if bool(old_impl.get("deleted")) != bool(impl.get("deleted")):
             chunks.append(f"### {label} · 删除标记")
@@ -202,8 +207,10 @@ def summarize_changes(before: Optional[Dict[str, Any]], after: Optional[Dict[str
         bits.append(f"删除实现 ({old_impls[impl_id].get('language')})")
 
     for impl_id in old_impls.keys() & new_impls.keys():
-        old_code = str(old_impls[impl_id].get("code") or "")
-        new_code = str(new_impls[impl_id].get("code") or "")
+        old_impl, new_impl = old_impls[impl_id], new_impls[impl_id]
+        lang = new_impl.get("language")
+        old_code = str(old_impl.get("code") or "")
+        new_code = str(new_impl.get("code") or "")
         if old_code != new_code:
             added_n = removed_n = 0
             for line in difflib.unified_diff(
@@ -213,10 +220,18 @@ def summarize_changes(before: Optional[Dict[str, Any]], after: Optional[Dict[str
                     added_n += 1
                 elif line.startswith("-") and not line.startswith("---"):
                     removed_n += 1
-            lang = new_impls[impl_id].get("language")
             bits.append(f"{lang} 代码 +{added_n}/-{removed_n}")
-        elif bool(old_impls[impl_id].get("deleted")) != bool(new_impls[impl_id].get("deleted")):
+        elif bool(old_impl.get("deleted")) != bool(new_impl.get("deleted")):
             bits.append("实现删除标记")
+
+        # 语言 / 标题 / 文件名 / 备注 / 前置要求 的元信息改动
+        changed_fields = [
+            field_label
+            for field_name, field_label in _IMPL_META_FIELDS
+            if str(old_impl.get(field_name) or "") != str(new_impl.get(field_name) or "")
+        ]
+        if changed_fields:
+            bits.append(f"{lang} 实现{'/'.join(changed_fields)}")
 
     return ", ".join(bits) if bits else "无实质变更"
 

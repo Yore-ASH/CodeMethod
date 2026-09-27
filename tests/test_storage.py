@@ -13,6 +13,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from codemethod.core.languages import get_language  # noqa: E402
 from codemethod.core.models import Implementation  # noqa: E402
 from codemethod.core.repository import Repository  # noqa: E402
 from codemethod.storage import container as fmt  # noqa: E402
@@ -362,8 +363,50 @@ class TestExporter(StorageTestCase):
     def test_entry_markdown_single(self):
         entry = list(self.repo.entries.values())[0]
         text = exporter.entry_to_markdown(entry, revisions=self.repo.revisions(entry.id))
-        self.assertIn("## 前置要求", text)
-        self.assertIn("前置", text)
+        self.assertIn("## 通用前置要求", text)
+        self.assertIn(entry.prerequisites, text)
+        # 每种语言自己的前置要求也要单独列出
+        self.assertIn("| 语言 | 前置要求 |", text)
+        for impl in entry.active_implementations:
+            self.assertIn(f"### {get_language(impl.language).name}", text)
+            self.assertIn(
+                "**前置要求**: " + (impl.prerequisites.strip() or "_（未填写）_"), text
+            )
+
+    def test_markdown_lists_prerequisites_per_language(self):
+        entry = self.repo.create_entry("多语言题", "", "通用要求: 无", ["x"])
+        self.repo.add_implementation(entry.id, "python", "print(1)", prerequisites="Python 3.10+")
+        self.repo.add_implementation(entry.id, "go", "package main", prerequisites="Go 1.21+")
+        entry = self.repo.require(entry.id)
+
+        text = exporter.entry_to_markdown(entry)
+        table_rows = [line for line in text.splitlines() if line.startswith("| ")]
+        self.assertIn("| Python | Python 3.10+ |", table_rows)
+        self.assertIn("| Go | Go 1.21+ |", table_rows)
+        # 未填写时用占位符, 不要漏行
+        self.repo.add_implementation(entry.id, "rust", "fn main(){}")
+        entry = self.repo.require(entry.id)
+        text = exporter.entry_to_markdown(entry)
+        self.assertIn("| Rust | — |", text)
+
+    def test_json_export_keeps_prerequisites(self):
+        entry = self.repo.create_entry("题", "", "", [])
+        self.repo.add_implementation(entry.id, "rust", "fn main(){}", prerequisites="cargo")
+        entry = self.repo.require(entry.id)
+
+        payload = json.loads(exporter.library_to_json(self.repo))
+        entries = payload["repository"]["entries"]
+        target = next(e for e in entries if e["id"] == entry.id)
+        self.assertEqual(target["implementations"][0]["prerequisites"], "cargo")
+
+    def test_zip_export_keeps_prerequisites(self):
+        entry = self.repo.create_entry("题", "", "", [])
+        self.repo.add_implementation(entry.id, "kotlin", "fun main(){}", prerequisites="Kotlin 1.9+")
+        target_zip = self.path("prereq.zip")
+        exporter.export_zip(self.repo, target_zip)
+        data = exporter.read_zip_export(target_zip)
+        target = next(e for e in data["entries"] if e["id"] == entry.id)
+        self.assertEqual(target["implementations"][0]["prerequisites"], "Kotlin 1.9+")
 
     def test_json_roundtrip(self):
         target = self.path("e.json")

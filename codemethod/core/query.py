@@ -21,7 +21,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from .languages import normalize_language
 from .models import STATUS_ORDER, Entry, tag_key
 
-_TOKEN_RE = re.compile(r'(-)?(?:([A-Za-z_]+):)?(?:"([^"]*)"|(\S+))')
+# 字段名允许非 ASCII (例如中文别名 前置:cargo), 因此不能用 [A-Za-z_]
+_TOKEN_RE = re.compile(r'(-)?(?:([^\s:"]+):)?(?:"([^"]*)"|(\S+))')
 
 
 class TagMatch(str, Enum):
@@ -162,9 +163,18 @@ def full_text_blob(entry: Entry, *, search_code: bool = True, search_description
         parts.append(impl.title)
         parts.append(impl.filename)
         parts.append(impl.notes)
+        # 每种语言自己的前置要求也要能被搜到, 例如 "cargo" / "Node 20"
+        parts.append(impl.prerequisites)
         if search_code:
             parts.append(impl.code)
     return "\n".join(parts).casefold()
+
+
+def prerequisites_blob(entry: Entry) -> str:
+    """条目「通用前置要求」+ 各语言前置要求 的合并文本 (小写)。"""
+    parts = [entry.prerequisites]
+    parts.extend(impl.prerequisites for impl in entry.active_implementations)
+    return "\n".join(p for p in parts if p).casefold()
 
 
 def _entry_matches_term(
@@ -193,6 +203,10 @@ def _entry_matches_term(
 
     elif field_name in ("status", "state"):
         hit = entry.status == low or entry.status_label.casefold() == low
+
+    elif field_name in ("prereq", "prereqs", "requires", "require", "前置"):
+        # 同时搜「通用前置要求」与各语言自己的前置要求
+        hit = low in prerequisites_blob(entry)
 
     elif field_name in ("is", "flag"):
         if low in ("favorite", "fav", "star", "收藏"):
@@ -233,8 +247,16 @@ def _entry_matches_text(
     if not terms:
         return True
     blob: Optional[str] = None
+    # 这些字段自带作用域, 不需要拼接全文 blob
+    scoped = {
+        "tag", "tags", "label",
+        "lang", "language",
+        "status", "state",
+        "is", "flag",
+        "prereq", "prereqs", "requires", "require", "前置",
+    }
     for term in terms:
-        needs_blob = term.field not in ("tag", "tags", "label", "lang", "language", "status", "state", "is", "flag")
+        needs_blob = term.field not in scoped
         if needs_blob and blob is None:
             blob = full_text_blob(
                 entry, search_code=search_code, search_description=search_description
@@ -387,6 +409,7 @@ __all__ = [
     "TextTerm",
     "parse_query_text",
     "full_text_blob",
+    "prerequisites_blob",
     "entry_matches",
     "query_entries",
     "sort_entries",

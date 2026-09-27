@@ -1426,7 +1426,14 @@ class MainWindow(QMainWindow):
   tag:network              仅匹配标签
   lang:python              仅匹配某种语言的实现 (支持 py / go / cpp 等别名)
   status:done              仅匹配某个规划状态
+  prereq:cargo             仅匹配前置要求 (通用 + 各语言自己的)
   is:favorite              仅收藏 (还有 is:deleted / is:multi / is:history / is:has_code)
+
+前置要求 (分语言)
+  条目左侧的「通用前置要求」放与语言无关的要求 (例如"需要理解双向链表");
+  每种语言自己的工具链 / 版本 / 依赖写在右侧每个实现页签的「前置要求」里。
+  同一个问题因此可以是: Python 版要 3.10+、Go 版要 1.21+、Rust 版要 cargo。
+  详情页「概览」按语言列出它们, 每种语言的页签顶部也会再显示一次。
 
 多标签组合
   在左侧标签面板勾选多个标签, 并选择:

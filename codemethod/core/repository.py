@@ -270,6 +270,7 @@ class Repository:
         title: str = "",
         filename: str = "",
         notes: str = "",
+        prerequisites: str = "",
         impl_id: Optional[str] = None,
         author: Optional[str] = None,
         summary: str = "",
@@ -284,6 +285,7 @@ class Repository:
             title=title,
             filename=filename,
             notes=notes,
+            prerequisites=prerequisites,
         )
         if any(existing.id == impl.id for existing in entry.implementations):
             raise RepositoryError(f"实现 id 冲突: {impl.id}")
@@ -312,6 +314,7 @@ class Repository:
         title: Optional[str] = None,
         filename: Optional[str] = None,
         notes: Optional[str] = None,
+        prerequisites: Optional[str] = None,
         author: Optional[str] = None,
         summary: str = "",
     ) -> Implementation:
@@ -331,6 +334,8 @@ class Repository:
             impl.filename = filename
         if notes is not None:
             impl.notes = notes
+        if prerequisites is not None:
+            impl.prerequisites = prerequisites
 
         impl.touch()
         entry.touch()

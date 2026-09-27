@@ -41,7 +41,7 @@ def build_demo_repository() -> Repository:
             "接受客户端连接, 把收到的每一行原样返回, 支持多个客户端并发。\n"
             "用于验证网络连通性、压测以及作为协议调试的最小骨架。"
         ),
-        prerequisites="Python 3.10+ / Go 1.21+；无需第三方库；本地可用的 9000 端口。",
+        prerequisites="本地可用的 9000 端口；需要理解 TCP 是面向字节流的, 没有消息边界。",
         tags=["network", "tcp", "server", "demo"],
         status="done",
         favorite=True,
@@ -51,6 +51,7 @@ def build_demo_repository() -> Repository:
         "python",
         title="基于 asyncio",
         notes="单线程事件循环, 适合高并发连接。",
+        prerequisites="Python 3.10+（用到 asyncio.start_server 与 wait_closed）；仅标准库。",
         code='''import asyncio
 
 
@@ -90,6 +91,7 @@ if __name__ == "__main__":
         "go",
         title="基于 goroutine",
         notes="每个连接一个 goroutine, 标准库即可。",
+        prerequisites="Go 1.21+；仅标准库 (net / bufio / log)；GOOS 任意。",
         code='''package main
 
 import (
@@ -143,13 +145,14 @@ func main() {
             "实现一个固定容量的最近最少使用缓存, get 与 put 均为 O(1)。\n"
             "核心思路: 哈希表 + 双向链表, 访问后把节点移到链表头部, 超容时淘汰尾部。"
         ),
-        prerequisites="需要理解双向链表；Python 版本可直接用 OrderedDict；C++ 版本需要 C++17。",
+        prerequisites="需要理解哈希表与双向链表的组合；与具体语言无关。",
         tags=["algorithm", "cache", "lru", "demo"],
         status="in_progress",
     )
     repo.add_implementation(
         lru.id,
         "python",
+        prerequisites="Python 3.7+（OrderedDict.move_to_end 自 3.2 起提供）；仅标准库。",
         code='''from collections import OrderedDict
 
 
@@ -184,6 +187,7 @@ class LRUCache:
         "cpp",
         title="手写双向链表",
         notes="C++ 中 list + unordered_map 的组合, 也可用 std::list::splice。",
+        prerequisites="C++17（用到 std::optional）；g++ 11+ 或 MSVC 19.3+；无需第三方库。",
         code='''#include <list>
 #include <optional>
 #include <stdexcept>
@@ -238,6 +242,7 @@ private:
     repo.add_implementation(
         fib.id,
         "rust",
+        prerequisites="Rust 1.75+ / cargo（含 #[cfg(test)] 单元测试，cargo test 可直接跑）。",
         code='''/// 计算 (base ^ exp) % modulus, 全程不溢出。
 pub fn mod_pow(mut base: u128, mut exp: u128, modulus: u128) -> u128 {
     if modulus == 1 {
@@ -362,6 +367,27 @@ def run_self_test(report_path: Optional[str] = None) -> int:
             reopened.repository.history.total_count() == repo.history.total_count(),
             f"{reopened.repository.history.total_count()} 条修订",
         )
+
+        # 前置要求是按语言分开存的, 存盘再读回必须还是分开的
+        multi = next(
+            (e for e in repo.entries_list() if len(e.active_implementations) > 1), None
+        )
+        if multi is None:
+            check("示例库含多语言实现", False, "找不到多语言条目")
+        else:
+            needs = [impl.prerequisites for impl in multi.active_implementations]
+            check(
+                "前置要求分语言存储",
+                len(set(needs)) == len(needs) and all(needs),
+                " / ".join(f"{n[:28]}" for n in needs),
+            )
+            reopened_entry = reopened.repository.get(multi.id)
+            restored_needs = (
+                [impl.prerequisites for impl in reopened_entry.active_implementations]
+                if reopened_entry
+                else []
+            )
+            check("前置要求存盘后仍按语言保留", restored_needs == needs)
 
         md = os.path.join(tmp, "lib.md")
         js = os.path.join(tmp, "lib.json")

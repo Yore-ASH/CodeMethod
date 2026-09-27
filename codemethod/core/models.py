@@ -78,13 +78,18 @@ def tag_key(tag: str) -> str:
 
 @dataclass
 class Implementation:
-    """某个条目在**一种语言**下的具体实现。"""
+    """某个条目在**一种语言**下的具体实现。
+
+    每种语言有自己的工具链与运行环境, 因此 **前置要求挂在实现上**:
+    例如同一道题, Python 版要 3.10+、Go 版要 1.21+、Rust 版要 cargo。
+    """
 
     language: str = DEFAULT_LANGUAGE
     code: str = ""
     title: str = ""
     filename: str = ""
     notes: str = ""
+    prerequisites: str = ""
     id: str = field(default_factory=lambda: new_id("impl_"))
     created_at: float = field(default_factory=utcnow)
     updated_at: float = field(default_factory=utcnow)
@@ -127,6 +132,7 @@ class Implementation:
             "filename": self.filename,
             "code": self.code,
             "notes": self.notes,
+            "prerequisites": self.prerequisites,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "version": self.version,
@@ -150,6 +156,8 @@ class Implementation:
             filename=filename,
             code=str(data.get("code") or ""),
             notes=str(data.get("notes") or ""),
+            # 旧版本没有这个字段: 缺失即为空, 向后兼容
+            prerequisites=str(data.get("prerequisites") or ""),
             created_at=float(data.get("created_at") or utcnow()),
             updated_at=float(data.get("updated_at") or utcnow()),
             version=int(data.get("version") or 1),
@@ -174,7 +182,12 @@ class Implementation:
 
 @dataclass
 class Entry:
-    """一个"功能条目": 描述 + 前置要求 + 标签 + 多语言实现。"""
+    """一个"功能条目": 描述 + 通用前置要求 + 标签 + 多语言实现。
+
+    ``prerequisites`` 是**所有语言共用**的前置要求 (例如「需要理解双向链表」);
+    每种语言自己的工具链/运行环境要求写在各自的
+    :attr:`Implementation.prerequisites` 上 (例如「Python 3.10+」)。
+    """
 
     title: str = ""
     description: str = ""
@@ -228,8 +241,20 @@ class Entry:
         for impl in self.active_implementations:
             parts.append(impl.title)
             parts.append(impl.notes)
+            # 每种语言的前置要求也要能被搜到 (例如 "需要 cargo")
+            parts.append(impl.prerequisites)
             parts.append(impl.code)
         return "\n".join(parts).casefold()
+
+    @property
+    def prerequisites_by_language(self) -> List[tuple]:
+        """``[(语言显示名, 该语言的前置要求), ...]``, 只列出填写过的。"""
+        from .languages import get_language
+
+        return [
+            (get_language(impl.language).name, impl.prerequisites.strip())
+            for impl in self.active_implementations
+        ]
 
     # ---- 变更 ----
     def touch(self) -> None:

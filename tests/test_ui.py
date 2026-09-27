@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from PySide6.QtCore import qInstallMessageHandler
     from PySide6.QtGui import QTextDocument
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
     qInstallMessageHandler(lambda *args: None)
     from codemethod.core.languages import LANGUAGES, all_languages
@@ -714,6 +714,171 @@ class TestSelfTest(_TrackedWidgets):
                 self.assertEqual(run_self_test(None), 0)
         # 能跑到这里且进程没崩, 就说明窗口被正确销毁了
         self.app.processEvents()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestPerLanguagePrerequisites(_TrackedWidgets):
+    """前置要求是分语言的: 每种实现各存一份, 并在界面上分开呈现。"""
+
+    def _window(self):
+        db = Database.create()
+        entry = db.repository.create_entry(
+            "字符串反转", "把字符串逆序", "需要理解字符编码 (与语言无关)", ["string"]
+        )
+        db.repository.add_implementation(
+            entry.id, "python", "def rev(s): return s[::-1]", prerequisites="Python 3.10+"
+        )
+        db.repository.add_implementation(
+            entry.id, "go", "package main", prerequisites="Go 1.21+, 仅标准库"
+        )
+        db.repository.add_implementation(
+            entry.id, "rust", "fn main(){}", prerequisites="Rust 1.75+ / cargo"
+        )
+        window = self.track(MainWindow(db))
+        window.show()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        return window, db, entry
+
+    def test_each_implementation_keeps_its_own_prerequisites(self):
+        window, db, entry = self._window()
+        stored = {i.language: i.prerequisites for i in db.repository.require(entry.id).active_implementations}
+        self.assertEqual(stored["python"], "Python 3.10+")
+        self.assertEqual(stored["go"], "Go 1.21+, 仅标准库")
+        self.assertEqual(stored["rust"], "Rust 1.75+ / cargo")
+        window.close()
+
+    def _subtree_text(self, widget) -> str:
+        """收集一个部件子树里的全部可见文本 (QLabel + QTextBrowser 都要看)。"""
+        from PySide6.QtWidgets import QTextBrowser
+
+        parts = [label.text() for label in widget.findChildren(QLabel)]
+        for browser in widget.findChildren(QTextBrowser):
+            parts.append(browser.toPlainText())
+        return "\n".join(parts)
+
+    def test_overview_lists_prerequisites_per_language(self):
+        window, db, entry = self._window()
+        overview = window.detail_panel.tabs.widget(0)
+        joined = self._subtree_text(overview)
+        for expected in ("Python 3.10+", "Go 1.21+, 仅标准库", "Rust 1.75+ / cargo"):
+            self.assertIn(expected, joined, f"概览未显示 {expected}")
+        window.close()
+
+    def test_each_language_tab_shows_its_own_prerequisites(self):
+        window, db, entry = self._window()
+        implementations = db.repository.require(entry.id).active_implementations
+        for index, impl in enumerate(implementations):
+            window.detail_panel.show_tab(index + 1)
+            self.app.processEvents()
+            page = window.detail_panel.tabs.widget(index + 1)
+            joined = self._subtree_text(page)
+            self.assertIn(impl.prerequisites, joined, f"{impl.language} 页签未显示前置要求")
+        window.close()
+
+    def test_shared_prerequisites_shown_separately(self):
+        window, db, entry = self._window()
+        overview = window.detail_panel.tabs.widget(0)
+        joined = self._subtree_text(overview)
+        self.assertIn("通用前置要求", joined)
+        self.assertIn("需要理解字符编码", joined)
+        window.close()
+
+    def test_implementation_editor_edits_prerequisites(self):
+        from codemethod.ui.dialogs.entry_editor import ImplementationEditor
+
+        editor = self.track(ImplementationEditor(theme=DARK_PLUS))
+        editor.language_combo.setCurrentIndex(editor.language_combo.findData("rust"))
+        editor.prerequisites_edit.setText("Rust 1.80+ / cargo")
+        collected = editor.collect()
+        self.assertEqual(collected.prerequisites, "Rust 1.80+ / cargo")
+        self.assertEqual(collected.language, "rust")
+
+    def test_implementation_editor_loads_prerequisites(self):
+        from codemethod.core.models import Implementation
+        from codemethod.ui.dialogs.entry_editor import ImplementationEditor
+
+        impl = Implementation(language="go", code="x", prerequisites="Go 1.22+")
+        editor = self.track(ImplementationEditor(theme=DARK_PLUS))
+        editor.load(impl)
+        self.assertEqual(editor.prerequisites_edit.text(), "Go 1.22+")
+
+    def test_entry_editor_collects_per_language_prerequisites(self):
+        from codemethod.ui.dialogs.entry_editor import EntryEditorDialog
+
+        window, db, entry = self._window()
+        dialog = EntryEditorDialog(window, entry=entry, theme=DARK_PLUS)
+        for index, editor in enumerate(dialog._editors, start=1):
+            editor.prerequisites_edit.setText(f"要求 #{index}")
+        data = dialog.result_data()
+        self.assertEqual(
+            [impl.prerequisites for impl in data["implementations"]],
+            ["要求 #1", "要求 #2", "要求 #3"],
+        )
+        db.repository.apply_entry(entry.id, implementations=list(data["implementations"]))
+        dialog.close()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        self.assertEqual(
+            [i.prerequisites for i in db.repository.require(entry.id).active_implementations],
+            ["要求 #1", "要求 #2", "要求 #3"],
+        )
+        window.close()
+
+    def test_implementation_dialog_passes_prerequisites_through(self):
+        from codemethod.ui.dialogs.implementation_dialog import ImplementationDialog
+
+        window, db, entry = self._window()
+        dialog = ImplementationDialog(window, entry=entry, theme=DARK_PLUS)
+        dialog.editor.language_combo.setCurrentIndex(
+            dialog.editor.language_combo.findData("php")
+        )
+        dialog.editor.editor.setPlainText("<?php echo 1;")
+        dialog.editor.prerequisites_edit.setText("PHP 8.2+")
+        result = dialog.result_implementation()
+        self.assertEqual(result.prerequisites, "PHP 8.2+")
+
+        db.repository.add_implementation(
+            entry.id, result.language, result.code, prerequisites=result.prerequisites
+        )
+        dialog.close()
+        window.refresh_all(select_id=entry.id)
+        self.app.processEvents()
+        php = next(
+            i for i in db.repository.require(entry.id).active_implementations
+            if i.language == "php"
+        )
+        self.assertEqual(php.prerequisites, "PHP 8.2+")
+        window.close()
+
+    def test_prerequisites_survive_save_and_reopen(self):
+        import tempfile
+
+        window, db, entry = self._window()
+        tmp = tempfile.mkdtemp(prefix="codemethod-prereq-")
+        for name in ("a.cmdb", "a.cmj"):
+            path = os.path.join(tmp, name)
+            db.save(path, binary=name.endswith(".cmdb"), backup=False)
+            reopened = Database.open(path)
+            stored = {
+                i.language: i.prerequisites
+                for i in reopened.repository.require(entry.id).active_implementations
+            }
+            self.assertEqual(stored["python"], "Python 3.10+", name)
+            self.assertEqual(stored["go"], "Go 1.21+, 仅标准库", name)
+        window.close()
+
+    def test_legacy_file_without_prerequisites_still_loads(self):
+        """旧版本写入的库没有该字段, 打开后应视为空而不是报错。"""
+        window, db, entry = self._window()
+        data = db.repository.to_dict()
+        for item in data["entries"]:
+            for impl in item.get("implementations", []):
+                impl.pop("prerequisites", None)
+        restored = Repository.from_dict(data)
+        impl = restored.require(entry.id).active_implementations[0]
+        self.assertEqual(impl.prerequisites, "")
+        window.close()
 
 
 if __name__ == "__main__":

@@ -167,6 +167,38 @@ class TestDiff(unittest.TestCase):
         removed = build_revision_diff({"implementations": [{"id": "i", "language": "go", "code": "x"}]}, {})
         self.assertIn("删除实现", removed)
 
+    def test_per_language_prerequisites_diff(self):
+        """改某种语言的前置要求要出现在差异里 (前置要求是分语言的)。"""
+        before = {
+            "implementations": [
+                {"id": "i1", "language": "python", "code": "x", "prerequisites": "Python 3.8+"},
+                {"id": "i2", "language": "go", "code": "y", "prerequisites": "Go 1.20+"},
+            ]
+        }
+        after = {
+            "implementations": [
+                {"id": "i1", "language": "python", "code": "x", "prerequisites": "Python 3.12+"},
+                {"id": "i2", "language": "go", "code": "y", "prerequisites": "Go 1.20+"},
+            ]
+        }
+        text = build_revision_diff(before, after)
+        self.assertIn("前置要求", text)
+        self.assertIn("-Python 3.8+", text)
+        self.assertIn("+Python 3.12+", text)
+        # Go 的前置要求没变, 就不该出现在任何以 +/- 开头的变更行里
+        changed_lines = [
+            line for line in text.splitlines()
+            if line.startswith(("-Go", "+Go", "-Go ", "+Go "))
+        ]
+        self.assertEqual(changed_lines, [], f"未变更的语言不应出现在差异里: {changed_lines}")
+
+    def test_summary_mentions_prerequisites_change(self):
+        before = {"implementations": [{"id": "i", "language": "rust", "code": "x", "prerequisites": ""}]}
+        after = {"implementations": [{"id": "i", "language": "rust", "code": "x", "prerequisites": "cargo"}]}
+        summary = summarize_changes(before, after)
+        self.assertIn("前置要求", summary)
+        self.assertNotIn("无实质变更", summary)
+
     def test_new_and_deleted_entry(self):
         self.assertIn("新增条目", build_revision_diff(None, {"title": "t"}))
         self.assertIn("删除条目", build_revision_diff({"title": "t"}, None))

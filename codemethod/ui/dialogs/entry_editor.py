@@ -94,14 +94,28 @@ class ImplementationEditor(QWidget):
         self.filename_edit.textChanged.connect(self._on_edited)
         meta.addWidget(self.filename_edit, 1)
 
-        meta.addWidget(QLabel("备注", self))
+        layout.addLayout(meta)
+
+        # ---- 前置要求 / 备注 (每种语言各不相同) ----
+        meta2 = QHBoxLayout()
+        meta2.setSpacing(6)
+
+        self.prereq_label = QLabel("前置要求", self)
+        meta2.addWidget(self.prereq_label)
+        self.prerequisites_edit = QLineEdit(self)
+        self.prerequisites_edit.setText(self._impl.prerequisites)
+        self.prerequisites_edit.textChanged.connect(self._on_edited)
+        meta2.addWidget(self.prerequisites_edit, 3)
+
+        meta2.addWidget(QLabel("备注", self))
         self.notes_edit = QLineEdit(self)
         self.notes_edit.setPlaceholderText("可选")
         self.notes_edit.setText(self._impl.notes)
         self.notes_edit.textChanged.connect(self._on_edited)
-        meta.addWidget(self.notes_edit, 1)
+        meta2.addWidget(self.notes_edit, 2)
 
-        layout.addLayout(meta)
+        layout.addLayout(meta2)
+        self._refresh_prereq_hint()
 
         # ---- 代码 ----
         self.editor = CodeEditor(self, language=self._impl.language, theme=theme)
@@ -138,7 +152,38 @@ class ImplementationEditor(QWidget):
         self._language = language
         self.editor.set_language(language)
         self._sync_filename(previous, language)
+        self._refresh_prereq_hint()
         self._on_edited()
+
+    def _refresh_prereq_hint(self) -> None:
+        """把"前置要求"这一项的提示写成该语言的例子, 提醒它是分语言的。"""
+        from ...core.languages import get_language
+
+        name = get_language(self.language_combo.currentData() or "plaintext").name
+        examples = {
+            "python": "Python 3.10+, 仅标准库",
+            "c": "GCC 11+ / C11, 链接 -lm",
+            "cpp": "C++17, g++ 11+ 或 MSVC 19.3+",
+            "go": "Go 1.21+, 仅标准库",
+            "java": "JDK 17+",
+            "php": "PHP 8.1+",
+            "rust": "Rust 1.75+, cargo",
+            "javascript": "Node.js 20+",
+            "typescript": "TypeScript 5+, Node 20+",
+            "csharp": ".NET 8 SDK",
+            "kotlin": "Kotlin 1.9+ / JDK 17+",
+            "swift": "Swift 5.9+ / Xcode 15+",
+            "ruby": "Ruby 3.2+",
+            "sql": "PostgreSQL 15+",
+            "bash": "bash 5+",
+        }
+        example = examples.get(self._language, "该语言的运行环境 / 依赖 / 版本要求")
+        self.prerequisites_edit.setPlaceholderText(f"{name} 需要什么, 例如: {example}")
+        self.prereq_label.setText(f"{name} 前置要求")
+        self.prereq_label.setToolTip(
+            "前置要求是**分语言**的: 同一个问题, Python 版要 3.10+、Go 版要 1.21+。\n"
+            "所有语言共用的要求请写在条目左侧的「通用前置要求」里。"
+        )
 
     def _sync_filename(self, previous: str, language: str) -> None:
         """让文件名后缀跟随语言变化。
@@ -175,9 +220,11 @@ class ImplementationEditor(QWidget):
         self.title_edit.setText(implementation.title)
         self.filename_edit.setText(implementation.filename)
         self.notes_edit.setText(implementation.notes)
+        self.prerequisites_edit.setText(implementation.prerequisites)
         self.editor.set_language(implementation.language)
         self.editor.setPlainText(implementation.code)
         self._loading = False
+        self._refresh_prereq_hint()
         self._update_stats()
 
     def collect(self) -> Implementation:
@@ -186,6 +233,7 @@ class ImplementationEditor(QWidget):
         impl.title = self.title_edit.text().strip()
         impl.filename = self.filename_edit.text().strip() or default_filename(impl.language)
         impl.notes = self.notes_edit.text().strip()
+        impl.prerequisites = self.prerequisites_edit.text().strip()
         code = self.editor.toPlainText()
         if code != impl.code:
             impl.code = code
@@ -321,9 +369,15 @@ class EntryEditorDialog(QDialog):
 
         self.prerequisites_edit = QPlainTextEdit(panel)
         self.prerequisites_edit.setPlaceholderText(
-            "前置要求: 依赖库 / 运行环境 / 版本 / 硬件 / 前置知识…"
+            "所有语言共用的前置要求, 例如: 需要理解双向链表 / 需要一段可用的公网地址。\n"
+            "（各语言自己的环境与依赖要求, 请写在右侧每种实现的「前置要求」里)…"
         )
-        layout.addWidget(self._labeled("前置要求", self.prerequisites_edit), 1)
+        shared_box = self._labeled("通用前置要求 (所有语言共用)", self.prerequisites_edit)
+        shared_box.setToolTip(
+            "这里只放与语言无关的要求。\n"
+            "语言相关的工具链/版本/依赖请填到对应实现的「前置要求」中。"
+        )
+        layout.addWidget(shared_box, 1)
 
         return panel
 
