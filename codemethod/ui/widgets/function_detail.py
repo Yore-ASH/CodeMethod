@@ -1,7 +1,12 @@
-"""函数体详情面板: 代码 + **变量含义表** + 独立的前置要求.
+"""函数体详情面板: **多语言实现** + 每种语言自己的变量含义表 + 前置要求.
 
-变量表是这一屏的主角 —— 自动检测出来的每个参数/字段/返回值都要求填含义,
-未填写的会在表里高亮出来。
+一个函数体可以有多种语言的实现 (Python / Go / Rust …), 每种实现各自持有:
+
+* 签名与代码;
+* **自己的前置要求** —— Python 版要 3.10+、Go 版要 1.21+;
+* **自己的变量含义表** —— 参数/字段/返回值必须写清楚含义。
+
+面板用一个语言下拉框切换实现, 下方代码与变量表随之整体切换。
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -28,11 +34,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.functions import Function, Symbol, symbol_kind_label
+from ...core.functions import Function, FunctionImplementation, Symbol
 from ...core.languages import get_language
 from ...core.models import STATUS_COLORS, STATUS_LABELS, format_ts
 from ..editor import CodePreview
 from ..theme import DEFAULT_THEME, Theme
+from .action_button import fit_action_button
+from .deleted_notice import DeletedNotice
 
 SYMBOL_COLUMNS = ("名称", "种类", "类型", "默认值", "含义")
 
@@ -99,7 +107,7 @@ class SymbolTable(QTableWidget):
 
 
 class FunctionDetailPanel(QWidget):
-    """展示一个函数体。"""
+    """展示一个函数体 (含它的全部语言实现)。"""
 
     edit_requested = Signal(str)
     history_requested = Signal(str)
@@ -109,7 +117,12 @@ class FunctionDetailPanel(QWidget):
     tag_clicked = Signal(str)
     copy_done = Signal(str)
     export_requested = Signal(str, str)
-    redetect_requested = Signal(str)
+    redetect_requested = Signal(str, str)
+    add_implementation_requested = Signal(str)
+    edit_implementation_requested = Signal(str, str)
+    delete_implementation_requested = Signal(str, str)
+    restore_requested = Signal(str)
+    purge_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
@@ -121,10 +134,14 @@ class FunctionDetailPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        self._deleted_notice = DeletedNotice(self)
+        self._deleted_notice.restore_requested.connect(self._emit_restore)
+        root.addWidget(self._deleted_notice)
+
         self._empty = QLabel(
             "选择左侧的一个函数体以查看\n\n"
             "函数体会自动检测变量声明, 并请你为每个变量填写含义。\n"
-            "它还有自己独立的前置要求 (例如「Python 3.10+」)。",
+            "**同一个函数可以用多种语言实现**, 每种语言都有自己的前置要求与变量表。",
             self,
         )
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -185,27 +202,35 @@ class FunctionDetailPanel(QWidget):
             "color:#C586C0; border:1px solid #C586C0; border-radius:8px; padding:1px 8px;"
         )
         info.addWidget(kind_badge)
-        self._language_badge = QLabel("", header)
-        info.addWidget(self._language_badge)
+        self._languages_badge = QLabel("", header)
+        info.addWidget(self._languages_badge)
         self._status_badge = QLabel("", header)
         info.addWidget(self._status_badge)
         self._unresolved = QLabel("", header)
         info.addWidget(self._unresolved)
-        self._meta = QLabel("", header)
-        self._meta.setObjectName("DimLabel")
-        info.addWidget(self._meta)
         info.addStretch(1)
+        layout.addLayout(info)
 
+        # 动作按钮单独占一行 —— 挤在徽章那一行时「重新检测变量」永远显示不全
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        actions.addStretch(1)
         self._edit_button = QPushButton("编辑", header)
         self._edit_button.clicked.connect(
             lambda: self._function and self.edit_requested.emit(self._function.id)
         )
+        self._add_impl_button = QPushButton("＋ 语言实现", header)
+        self._add_impl_button.setProperty("flat", True)
+        self._add_impl_button.setToolTip("为同一个函数再添加一种语言的实现")
+        self._add_impl_button.clicked.connect(
+            lambda: self._function and self.add_implementation_requested.emit(self._function.id)
+        )
         self._detect_button = QPushButton("重新检测变量", header)
         self._detect_button.setProperty("flat", True)
-        self._detect_button.setToolTip("按当前代码重新扫描变量声明 (已填写的含义不会被覆盖)")
-        self._detect_button.clicked.connect(
-            lambda: self._function and self.redetect_requested.emit(self._function.id)
+        self._detect_button.setToolTip(
+            "按当前语言实现的代码重新扫描变量声明 (已填写的含义不会被覆盖)"
         )
+        self._detect_button.clicked.connect(self._emit_redetect)
         self._history_button = QPushButton("历史", header)
         self._history_button.setProperty("flat", True)
         self._history_button.clicked.connect(
@@ -218,11 +243,21 @@ class FunctionDetailPanel(QWidget):
         self._more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._build_more_menu()
 
-        info.addWidget(self._edit_button)
-        info.addWidget(self._detect_button)
-        info.addWidget(self._history_button)
-        info.addWidget(self._more_button)
-        layout.addLayout(info)
+        for button in (
+            self._edit_button,
+            self._add_impl_button,
+            self._detect_button,
+            self._history_button,
+        ):
+            fit_action_button(button)
+            actions.addWidget(button)
+        actions.addWidget(self._more_button)
+        layout.addLayout(actions)
+
+        self._meta = QLabel("", header)
+        self._meta.setObjectName("DimLabel")
+        self._meta.setWordWrap(True)
+        layout.addWidget(self._meta)
 
         divider = QFrame(header)
         divider.setFrameShape(QFrame.Shape.HLine)
@@ -230,19 +265,41 @@ class FunctionDetailPanel(QWidget):
         layout.addWidget(divider)
         return header
 
+    def _emit_redetect(self) -> None:
+        if self._function is None:
+            return
+        impl = self._current_implementation()
+        self.redetect_requested.emit(self._function.id, impl.id if impl else "")
+
+    def _emit_restore(self) -> None:
+        if self._function is not None:
+            self.restore_requested.emit(self._function.id)
+
+    def _emit_purge(self) -> None:
+        if self._function is not None:
+            self.purge_requested.emit(self._function.id)
+
+    def set_deleted_notice(self, is_deleted: bool) -> None:
+        """对象在回收站里时, 顶部显示恢复提示条, 并禁用编辑类按钮。"""
+        self._deleted_notice.setVisible(bool(is_deleted))
+        for button in (self._edit_button, self._add_impl_button, self._detect_button):
+            button.setEnabled(not is_deleted)
+
     def _build_more_menu(self) -> None:
         menu = QMenu(self._more_button)
         items = [
+            ("编辑当前语言实现", lambda: self._emit_edit_implementation()),
+            ("删除当前语言实现", lambda: self._emit_delete_implementation()),
+            (None, None),
             ("复制代码", self._copy_code),
             ("复制变量含义表", self._copy_symbols),
-            ("复制函数体为 Markdown",
-             lambda: self._function and self.export_requested.emit(self._function.id, "markdown")),
-            ("复制函数体为 JSON",
-             lambda: self._function and self.export_requested.emit(self._function.id, "json")),
+            ("复制函数体为 Markdown", lambda: self._emit_export("markdown")),
+            ("复制函数体为 JSON", lambda: self._emit_export("json")),
             (None, None),
             ("创建副本", lambda: self._function and self.duplicate_requested.emit(self._function.id)),
             ("删除函数体", lambda: self._function and self.delete_requested.emit(self._function.id)),
         ]
+        self._more_actions: Dict[str, QAction] = {}
         for text, slot in items:
             if text is None:
                 menu.addSeparator()
@@ -250,7 +307,22 @@ class FunctionDetailPanel(QWidget):
             action = QAction(text, menu)
             action.triggered.connect(slot)
             menu.addAction(action)
+            self._more_actions[text] = action
         self._more_button.setMenu(menu)
+
+    def _emit_edit_implementation(self) -> None:
+        impl = self._current_implementation()
+        if self._function is not None and impl is not None:
+            self.edit_implementation_requested.emit(self._function.id, impl.id)
+
+    def _emit_delete_implementation(self) -> None:
+        impl = self._current_implementation()
+        if self._function is not None and impl is not None:
+            self.delete_implementation_requested.emit(self._function.id, impl.id)
+
+    def _emit_export(self, fmt: str) -> None:
+        if self._function is not None:
+            self.export_requested.emit(self._function.id, fmt)
 
     def _build_code_panel(self) -> QWidget:
         panel = QWidget(self._content)
@@ -258,15 +330,38 @@ class FunctionDetailPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # 语言实现切换条
+        bar = QWidget(panel)
+        bar.setObjectName("CodeHeader")
+        bar.setFixedHeight(34)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(10, 0, 8, 0)
+        bar_layout.setSpacing(6)
+        bar_layout.addWidget(QLabel("语言实现", bar))
+        self.language_combo = QComboBox(bar)
+        self.language_combo.setMinimumWidth(200)
+        self.language_combo.currentIndexChanged.connect(self._on_language_changed)
+        bar_layout.addWidget(self.language_combo)
+        self._impl_summary = QLabel("", bar)
+        self._impl_summary.setObjectName("DimLabel")
+        bar_layout.addWidget(self._impl_summary)
+        bar_layout.addStretch(1)
+        copy_button = QToolButton(bar)
+        copy_button.setText("复制代码")
+        copy_button.setAutoRaise(True)
+        copy_button.clicked.connect(self._copy_code)
+        bar_layout.addWidget(copy_button)
+        layout.addWidget(bar)
+
         self.tabs = QTabWidget(panel)
         self.tabs.setDocumentMode(True)
 
         self.preview = CodePreview(self.tabs, theme=self._theme)
         self.preview.set_editable(False)
-        self.preview.edit_requested.connect(
-            lambda: self._function and self.edit_requested.emit(self._function.id)
+        self.preview.edit_requested.connect(self._emit_edit_implementation)
+        self.preview.copy_requested.connect(
+            lambda _t: self.copy_done.emit("已复制函数代码到剪贴板")
         )
-        self.preview.copy_requested.connect(lambda _t: self.copy_done.emit("已复制函数代码到剪贴板"))
         self.tabs.addTab(self.preview, "代码")
 
         prereq_page = QWidget(self.tabs)
@@ -302,9 +397,7 @@ class FunctionDetailPanel(QWidget):
         row = QHBoxLayout(bar)
         row.setContentsMargins(10, 0, 8, 0)
         row.setSpacing(6)
-        label = QLabel("变量含义", bar)
-        label.setObjectName("MutedLabel")
-        row.addWidget(label)
+        row.addWidget(QLabel("变量含义", bar))
         self._symbol_summary = QLabel("", bar)
         self._symbol_summary.setObjectName("DimLabel")
         row.addWidget(self._symbol_summary)
@@ -317,31 +410,105 @@ class FunctionDetailPanel(QWidget):
         layout.addWidget(bar)
 
         self.symbol_table = SymbolTable(panel, theme=self._theme)
-        self.symbol_table.symbol_activated.connect(
-            lambda _name: self._function and self.edit_requested.emit(self._function.id)
-        )
+        self.symbol_table.symbol_activated.connect(lambda _name: self._emit_edit_implementation())
         layout.addWidget(self.symbol_table, 1)
         return panel
 
     # ----------------------------------------------------------------------------
-    def _copy_code(self) -> None:
+    def _current_implementation(self) -> Optional[FunctionImplementation]:
         if self._function is None:
+            return None
+        impl_id = self.current_implementation_id()
+        if impl_id:
+            impl = self._function.get_implementation(impl_id)
+            if impl is not None and not impl.deleted:
+                return impl
+        actives = self._function.active_implementations
+        return actives[0] if actives else None
+
+    def current_implementation_id(self) -> str:
+        data = self.language_combo.currentData()
+        return str(data or "")
+
+    def show_implementation(self, implementation_id: str) -> bool:
+        """切到指定实现 (供外部在添加实现后定位)。"""
+        index = self.language_combo.findData(implementation_id)
+        if index < 0:
+            return False
+        self.language_combo.setCurrentIndex(index)
+        return True
+
+    def _on_language_changed(self, _index: int) -> None:
+        impl = self._current_implementation()
+        if impl is None:
+            self.preview.set_code("", language="plaintext", filename="")
+            self.symbol_table.load([])
+            self._impl_summary.setText("")
             return
-        QApplication.clipboard().setText(self._function.code)
-        self.copy_done.emit(f"已复制代码 ({self._function.total_lines} 行) 到剪贴板")
+        self._render_implementation(impl)
+
+    def _render_implementation(self, impl: FunctionImplementation) -> None:
+        language = get_language(impl.language)
+        filename = f"{self._function.name}.{language.extensions[0]}" if (
+            self._function and language.extensions
+        ) else (self._function.name if self._function else "")
+        self.preview.set_code(impl.code, language=impl.language, filename=filename)
+        self.tabs.setTabText(0, f"代码 · {language.name}")
+
+        prereq = impl.prerequisites.strip() or (self._function.prerequisites if self._function else "")
+        self.prereq_view.setHtml(
+            self._html_or_placeholder(prereq, "（这一语言实现还没有填写前置要求）")
+        )
+        description = impl.notes.strip() or (self._function.description if self._function else "")
+        self.notes_view.setHtml(self._html_or_placeholder(description, "（未填写说明）"))
+
+        self.symbol_table.load(impl.symbols)
+        blank = len(impl.required_symbols_missing_meaning)
+        self._symbol_summary.setText(
+            f"({len(impl.symbols)} 个, {blank} 个必填项待填写)" if blank
+            else f"({len(impl.symbols)} 个, 全部已填写)"
+        )
+        self._symbol_summary.setStyleSheet(
+            f"color:{self._theme.warning};" if blank else ""
+        )
+        self._impl_summary.setText(
+            f"{impl.line_count} 行 · {len(impl.symbols)} 个变量"
+            + (f" · ⚠ {blank} 项待填" if blank else "")
+        )
+        self._update_impl_actions(impl)
+
+    def _update_impl_actions(self, impl: FunctionImplementation) -> None:
+        has_function = self._function is not None
+        count = len(self._function.active_implementations) if self._function else 0
+        self._more_actions["删除当前语言实现"].setEnabled(has_function and count > 1)
+        self._detect_button.setEnabled(has_function and bool(impl.code.strip()))
+
+    # ----------------------------------------------------------------------------
+    def _copy_code(self) -> None:
+        impl = self._current_implementation()
+        if impl is None:
+            self.copy_done.emit("该函数体还没有任何语言实现, 用「＋ 语言实现」添加")
+            return
+        QApplication.clipboard().setText(impl.code)
+        self.copy_done.emit(
+            f"已复制 {impl.language_name} 实现 ({impl.line_count} 行) 到剪贴板"
+        )
 
     def _copy_symbols(self) -> None:
-        if self._function is None:
+        impl = self._current_implementation()
+        if impl is None:
             return
         lines = ["| 名称 | 种类 | 类型 | 默认值 | 含义 |", "| --- | --- | --- | --- | --- |"]
-        for symbol in self._function.symbols:
+        for symbol in impl.symbols:
             lines.append(
                 f"| `{symbol.name}` | {symbol.kind_label} | {symbol.type or '—'} "
                 f"| {symbol.default or '—'} | {symbol.meaning or '（未填写）'} |"
             )
         text = "\n".join(lines)
         QApplication.clipboard().setText(text)
-        self.copy_done.emit(f"已复制 {len(self._function.symbols)} 个变量的含义表到剪贴板")
+        self.copy_done.emit(
+            f"已复制 {impl.language_name} 的 {len(impl.symbols)} 个变量含义到剪贴板"
+        )
 
     def set_entry(self, function: Optional[Function], *, tag_colors: Optional[Dict[str, str]] = None) -> None:
         """与模块详情保持同名接口。"""
@@ -354,6 +521,7 @@ class FunctionDetailPanel(QWidget):
             self._empty.setVisible(True)
             self._status_label.setText("")
             self.symbol_table.setRowCount(0)
+            self.language_combo.clear()
             return
 
         self._empty.setVisible(False)
@@ -361,11 +529,14 @@ class FunctionDetailPanel(QWidget):
 
         self._title.setText(function.display_title)
         self._fav_button.setText("★" if function.favorite else "☆")
-        self._language_badge.setText(get_language(function.language).name)
-        self._language_badge.setStyleSheet(
-            f"color:{get_language(function.language).color};"
-            f"border:1px solid {get_language(function.language).color};"
-            "border-radius:8px; padding:1px 8px;"
+        actives = function.active_implementations
+        langs = [get_language(impl.language) for impl in actives]
+        self._languages_badge.setText(f"{len(actives)} 语言")
+        self._languages_badge.setStyleSheet(
+            "color:#569CD6; border:1px solid #569CD6; border-radius:8px; padding:1px 8px;"
+        )
+        self._languages_badge.setToolTip(
+            "、".join(lang.name for lang in langs) or "还没有语言实现"
         )
         self._status_badge.setText(STATUS_LABELS.get(function.status, function.status))
         self._status_badge.setStyleSheet(
@@ -379,30 +550,46 @@ class FunctionDetailPanel(QWidget):
             self._unresolved.setStyleSheet(f"color:{self._theme.warning}; font-weight:bold;")
         else:
             self._unresolved.setText("")
+
+        # 语言下拉框 (保留当前选择)
+        previous = self.current_implementation_id()
+        self.language_combo.blockSignals(True)
+        self.language_combo.clear()
+        for impl in actives:
+            language = get_language(impl.language)
+            self.language_combo.addItem(
+                f"{language.name} · {impl.line_count} 行 · {len(impl.symbols)} 变量", impl.id
+            )
+        self.language_combo.blockSignals(False)
+        index = self.language_combo.findData(previous)
+        self.language_combo.setCurrentIndex(index if index >= 0 else 0)
+
         self._meta.setText(
-            f"更新 {format_ts(function.updated_at)} · {function.total_lines} 行 · "
-            f"{len(function.symbols)} 个变量 · ID {function.id}"
+            f"更新 {format_ts(function.updated_at)} · {len(actives)} 种语言 · "
+            f"{function.total_lines} 行 · {function.total_symbols} 个变量 · "
+            f"ID {function.id}"
         )
 
-        self.preview.set_code(
-            function.code, language=function.language, filename=f"{function.name or 'function'}"
-        )
-        self.tabs.setTabText(0, f"代码 · {get_language(function.language).name}")
-
-        self.prereq_view.setHtml(self._html_or_placeholder(function.prerequisites, "（未填写前置要求）"))
-        self.notes_view.setHtml(self._html_or_placeholder(function.description, "（未填写说明）"))
-
-        self.symbol_table.load(function.symbols)
-        blank = len(function.symbols_missing_meaning)
-        self._symbol_summary.setText(
-            f"({len(function.symbols)} 个, {blank} 个待填写)" if blank
-            else f"({len(function.symbols)} 个, 全部已填写)"
-        )
+        impl = self._current_implementation()
+        if impl is None:
+            self.preview.set_code("", language="plaintext", filename="")
+            self.tabs.setTabText(0, "代码")
+            self.prereq_view.setHtml(
+                self._html_or_placeholder(function.prerequisites, "（未填写前置要求）")
+            )
+            self.notes_view.setHtml(
+                self._html_or_placeholder(function.description, "（未填写说明）")
+            )
+            self.symbol_table.load([])
+            self._symbol_summary.setText("(还没有语言实现)")
+            self._impl_summary.setText("尚未添加实现")
+            self._detect_button.setEnabled(False)
+            self._more_actions["删除当前语言实现"].setEnabled(False)
+        else:
+            self._render_implementation(impl)
 
         self._status_label.setText(
-            f"{function.language_name} · {function.total_lines} 行 · "
-            f"{len(function.symbols)} 个变量 · "
-            + (f"{len(missing)} 个必填项未完成" if missing else "含义已完整")
+            f"{len(actives)} 种语言 · {function.total_lines} 行 · {function.meanings_summary}"
         )
 
     @staticmethod
@@ -422,6 +609,17 @@ class FunctionDetailPanel(QWidget):
         self._theme = theme
         self.preview.editor.set_theme(theme)
         self.symbol_table.set_theme(theme)
+        for button in (
+            self._edit_button,
+            self._add_impl_button,
+            self._detect_button,
+            self._history_button,
+        ):
+            fit_action_button(button)
+        if self._function is not None:
+            impl = self._current_implementation()
+            if impl is not None:
+                self._render_implementation(impl)
 
 
-__all__ = ["FunctionDetailPanel", "SymbolTable", "SYMBOL_COLUMNS"]
+__all__ = ["FunctionDetailPanel", "SymbolTable", "SYMBOL_COLUMNS", "fit_action_button"]

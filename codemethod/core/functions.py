@@ -1,12 +1,15 @@
-"""函数体 (Function): 某一个语言里的一个具体函数, 外加"变量含义表"与前置要求.
+"""函数体 (Function): 一个函数, 可以用**多种语言**分别实现.
 
-与"模块"的区别
+与"模块"的关系
 --------------
-* 模块 = 一个问题 + 多语言实现 (横向对比不同语言的解法);
-* 函数体 = **一个**语言里的**一个**函数, 关注点在于把它讲清楚:
-  自动检测出参数/局部变量/字段/常量, 并要求用户逐个填写含义。
+两者结构上是对称的, 都用"一个描述 + 多个语言实现"来表达:
 
-因此函数体有独立的 ``prerequisites`` (它自己的前置要求), 不与模块共用。
+* **模块 (Entry)** —— 实现里放的是**一段代码**;
+* **函数体 (Function)** —— 实现里放的是**一个函数**, 于是额外带一张
+  **变量含义表**, 并要求把参数/字段/返回值的含义写清楚。
+
+因此 ``Function`` 与 ``Entry`` 一样有 ``implementations``; 每种语言的实现各自持有
+自己的签名、代码、前置要求与变量表 —— 同一个函数, Python 版要 3.10+、Go 版要 1.21+。
 """
 
 from __future__ import annotations
@@ -120,25 +123,21 @@ class Symbol:
 
 
 # --------------------------------------------------------------------------------------
-# Function
+# FunctionImplementation
 # --------------------------------------------------------------------------------------
 
 
 @dataclass
-class Function:
-    """一个具体语言的函数体。"""
+class FunctionImplementation:
+    """某个函数在**一种语言**下的实现, 含该语言自己的变量含义表。"""
 
-    name: str = ""
     language: str = "python"
     signature: str = ""
     code: str = ""
-    description: str = ""
-    prerequisites: str = ""       # 函数体**自己的**前置要求
+    notes: str = ""
+    prerequisites: str = ""       # 这一种语言自己的前置要求
     symbols: List[Symbol] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
-    status: str = "planned"
-    favorite: bool = False
-    id: str = field(default_factory=lambda: new_id("fn_"))
+    id: str = field(default_factory=lambda: new_id("fimpl_"))
     created_at: float = field(default_factory=utcnow)
     updated_at: float = field(default_factory=utcnow)
     version: int = 1
@@ -147,27 +146,20 @@ class Function:
 
     def __post_init__(self) -> None:
         self.language = normalize_language(self.language)
-        self.tags = normalize_tags(self.tags)
-        if self.status not in STATUS_ORDER:
-            self.status = "planned"
         self.symbols = list(self.symbols)
 
-    # ---- 与模块/空间统一的接口 ----
-    kind = "function"
-
+    # ---- 便捷属性 ----
     @property
-    def kind_label(self) -> str:
-        return "函数体"
+    def language_name(self) -> str:
+        return get_language(self.language).name
 
     @property
     def display_title(self) -> str:
-        if self.name.strip():
-            return self.name.strip()
-        return "未命名函数"
+        return self.notes.strip() or self.language_name
 
     @property
-    def status_label(self) -> str:
-        return STATUS_LABELS.get(self.status, self.status)
+    def line_count(self) -> int:
+        return len(self.code.splitlines()) if self.code else 0
 
     @property
     def badge_count(self) -> int:
@@ -177,32 +169,9 @@ class Function:
     def badge_label(self) -> str:
         return f"{len(self.symbols)} 变量"
 
-    @property
-    def languages(self) -> List[str]:
-        return [self.language]
-
-    @property
-    def total_lines(self) -> int:
-        return len(self.code.splitlines()) if self.code else 0
-
-    @property
-    def language_name(self) -> str:
-        return get_language(self.language).name
-
-    @property
-    def search_blob(self) -> str:
-        parts = [self.name, self.description, self.prerequisites, self.signature, " ".join(self.tags)]
-        for symbol in self.symbols:
-            parts.append(symbol.name)
-            parts.append(symbol.type)
-            parts.append(symbol.meaning)
-        parts.append(self.code)
-        return "\n".join(parts).casefold()
-
     # ---- 变量含义 ----
     @property
     def symbols_missing_meaning(self) -> List[Symbol]:
-        """还没填含义的符号 (必填的排在前面)。"""
         blank = [s for s in self.symbols if s.is_blank]
         return sorted(blank, key=lambda s: (not s.needs_meaning, s.name))
 
@@ -246,8 +215,8 @@ class Function:
         需要 ``name`` / ``kind`` / ``type`` / ``detail`` / ``default`` 属性)。
         返回新增的符号数量。
         """
-        # 参数被重新赋值时 (Python 的 `base %= m`、Rust 的 `let mut` 之类) 检测器会
-        # 同时报出同名局部量。那不是新声明, 在表里重复出现只会制造噪声, 所以过滤掉。
+        # 参数被重新赋值时 (Python 的 `base %= m` 之类) 检测器会同时报出同名局部量。
+        # 那不是新声明, 在表里重复出现只会制造噪声, 所以过滤掉。
         parameter_names = {
             str(getattr(item, "name", "")).strip()
             for item in detected
@@ -286,7 +255,12 @@ class Function:
                 added += 1
         # 代码里已经找不到的符号仍然保留 —— 用户可能刻意标注过
         merged.extend(existing.values())
-        merged.sort(key=lambda s: (SYMBOL_KIND_ORDER.index(s.kind) if s.kind in SYMBOL_KIND_ORDER else 99, s.name))
+        merged.sort(
+            key=lambda s: (
+                SYMBOL_KIND_ORDER.index(s.kind) if s.kind in SYMBOL_KIND_ORDER else 99,
+                s.name,
+            )
+        )
         self.set_symbols(merged)
         return added
 
@@ -299,13 +273,212 @@ class Function:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "name": self.name,
             "language": self.language,
             "signature": self.signature,
             "code": self.code,
-            "description": self.description,
+            "notes": self.notes,
             "prerequisites": self.prerequisites,
             "symbols": [s.to_dict() for s in self.symbols],
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "version": self.version,
+            "deleted": self.deleted,
+            "extra": dict(self.extra),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FunctionImplementation":
+        symbols = [
+            Symbol.from_dict(item)
+            for item in (data.get("symbols") or [])
+            if isinstance(item, dict)
+        ]
+        language = data.get("language")
+        return cls(
+            id=str(data.get("id") or new_id("fimpl_")),
+            language=normalize_language(language) if language else "python",
+            signature=str(data.get("signature") or ""),
+            code=str(data.get("code") or ""),
+            notes=str(data.get("notes") or ""),
+            prerequisites=str(data.get("prerequisites") or ""),
+            symbols=symbols,
+            created_at=float(data.get("created_at") or utcnow()),
+            updated_at=float(data.get("updated_at") or utcnow()),
+            version=int(data.get("version") or 1),
+            deleted=bool(data.get("deleted", False)),
+            extra=dict(data.get("extra") or {}),
+        )
+
+    def clone(self, *, new_identity: bool = False) -> "FunctionImplementation":
+        data = self.to_dict()
+        if new_identity:
+            data["id"] = new_id("fimpl_")
+            data["created_at"] = utcnow()
+            data["updated_at"] = data["created_at"]
+            data["version"] = 1
+        return FunctionImplementation.from_dict(data)
+
+
+# --------------------------------------------------------------------------------------
+# Function
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class Function:
+    """一个函数 —— 同一个函数可以有多语言实现, 每种语言各有一张变量含义表。"""
+
+    name: str = ""
+    description: str = ""
+    prerequisites: str = ""       # 通用前置要求 (所有语言共用)
+    implementations: List[FunctionImplementation] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    status: str = "planned"
+    favorite: bool = False
+    id: str = field(default_factory=lambda: new_id("fn_"))
+    created_at: float = field(default_factory=utcnow)
+    updated_at: float = field(default_factory=utcnow)
+    version: int = 1
+    deleted: bool = False
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.tags = normalize_tags(self.tags)
+        if self.status not in STATUS_ORDER:
+            self.status = "planned"
+        self.implementations = list(self.implementations)
+
+    # ---- 与模块/空间统一的接口 ----
+    kind = "function"
+
+    @property
+    def kind_label(self) -> str:
+        return "函数体"
+
+    @property
+    def display_title(self) -> str:
+        return self.name.strip() or "未命名函数"
+
+    @property
+    def status_label(self) -> str:
+        return STATUS_LABELS.get(self.status, self.status)
+
+    @property
+    def badge_count(self) -> int:
+        return len(self.active_implementations)
+
+    @property
+    def badge_label(self) -> str:
+        return f"{len(self.active_implementations)} 语言"
+
+    @property
+    def active_implementations(self) -> List[FunctionImplementation]:
+        return [impl for impl in self.implementations if not impl.deleted]
+
+    @property
+    def languages(self) -> List[str]:
+        seen: List[str] = []
+        for impl in self.active_implementations:
+            if impl.language not in seen:
+                seen.append(impl.language)
+        return seen
+
+    @property
+    def language(self) -> str:
+        """主语言 (第一个实现); 没有任何实现时为 ``plaintext``。"""
+        active = self.active_implementations
+        return active[0].language if active else "plaintext"
+
+    @property
+    def total_lines(self) -> int:
+        return sum(impl.line_count for impl in self.active_implementations)
+
+    @property
+    def total_symbols(self) -> int:
+        return sum(len(impl.symbols) for impl in self.active_implementations)
+
+    @property
+    def search_blob(self) -> str:
+        parts = [self.name, self.description, self.prerequisites, " ".join(self.tags)]
+        for impl in self.active_implementations:
+            parts.append(impl.language)
+            parts.append(impl.language_name)
+            parts.append(impl.signature)
+            parts.append(impl.notes)
+            parts.append(impl.prerequisites)
+            for symbol in impl.symbols:
+                parts.append(symbol.name)
+                parts.append(symbol.type)
+                parts.append(symbol.meaning)
+            parts.append(impl.code)
+        return "\n".join(p for p in parts if p).casefold()
+
+    # ---- 实现访问 ----
+    def get_implementation(self, impl_id: str) -> Optional[FunctionImplementation]:
+        for impl in self.implementations:
+            if impl.id == impl_id:
+                return impl
+        return None
+
+    def find_by_language(self, language: str) -> List[FunctionImplementation]:
+        wanted = normalize_language(language)
+        return [impl for impl in self.active_implementations if impl.language == wanted]
+
+    # ---- 变量含义 (跨语言汇总) ----
+    @property
+    def all_symbols(self) -> List[Symbol]:
+        out: List[Symbol] = []
+        for impl in self.active_implementations:
+            out.extend(impl.symbols)
+        return out
+
+    @property
+    def unresolved_implementations(self) -> List[FunctionImplementation]:
+        """还有必填变量没填含义的实现。"""
+        return [impl for impl in self.active_implementations if impl.has_unresolved_symbols]
+
+    @property
+    def has_unresolved_symbols(self) -> bool:
+        return bool(self.unresolved_implementations)
+
+    @property
+    def required_symbols_missing_meaning(self) -> List[Symbol]:
+        out: List[Symbol] = []
+        for impl in self.active_implementations:
+            out.extend(impl.required_symbols_missing_meaning)
+        return out
+
+    @property
+    def symbols_missing_meaning(self) -> List[Symbol]:
+        out: List[Symbol] = []
+        for impl in self.active_implementations:
+            out.extend(impl.symbols_missing_meaning)
+        return out
+
+    @property
+    def meanings_summary(self) -> str:
+        """一句话概括变量含义的完成度。"""
+        total = self.total_symbols
+        if not total:
+            return "尚未检测到变量"
+        missing = len(self.required_symbols_missing_meaning)
+        if missing:
+            return f"{total} 个变量, {missing} 个必填项待填写"
+        return f"{total} 个变量, 含义已完整"
+
+    # ---- 变更 ----
+    def touch(self) -> None:
+        self.updated_at = utcnow()
+        self.version += 1
+
+    # ---- 序列化 ----
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "prerequisites": self.prerequisites,
+            "implementations": [impl.to_dict() for impl in self.implementations],
             "tags": list(self.tags),
             "status": self.status,
             "favorite": self.favorite,
@@ -318,21 +491,39 @@ class Function:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Function":
-        symbols = [
-            Symbol.from_dict(item)
-            for item in (data.get("symbols") or [])
-            if isinstance(item, dict)
-        ]
-        language = data.get("language")
+        raw_impls = data.get("implementations")
+        if raw_impls:
+            implementations = [
+                FunctionImplementation.from_dict(item)
+                for item in raw_impls
+                if isinstance(item, dict)
+            ]
+        elif data.get("code") is not None or data.get("language") is not None:
+            # 旧版本 (1.2 及以前) 把单个实现的字段平铺在函数上, 这里迁移成一条实现。
+            # 那个 prerequisites 是"这个函数自己的", 因此移到实现上; 通用前置要求留空。
+            language = data.get("language")
+            implementations = [
+                FunctionImplementation(
+                    language=normalize_language(language) if language else "plaintext",
+                    signature=str(data.get("signature") or ""),
+                    code=str(data.get("code") or ""),
+                    prerequisites=str(data.get("prerequisites") or ""),
+                    symbols=[
+                        Symbol.from_dict(item)
+                        for item in (data.get("symbols") or [])
+                        if isinstance(item, dict)
+                    ],
+                )
+            ]
+            data = dict(data)
+            data["prerequisites"] = ""
+
         return cls(
             id=str(data.get("id") or new_id("fn_")),
             name=str(data.get("name") or ""),
-            language=normalize_language(language) if language else "plaintext",
-            signature=str(data.get("signature") or ""),
-            code=str(data.get("code") or ""),
             description=str(data.get("description") or ""),
             prerequisites=str(data.get("prerequisites") or ""),
-            symbols=symbols,
+            implementations=implementations,
             tags=list(data.get("tags") or []),
             status=str(data.get("status") or "planned"),
             favorite=bool(data.get("favorite", False)),
@@ -348,25 +539,27 @@ class Function:
 
     def suggest_language_from_code(self) -> None:
         """没有指定语言时, 从代码内容里猜一个 (仅在语言仍是 plaintext 时生效)。"""
-        if self.language != "plaintext":
-            return
-        signature = self.signature or self.code[:400]
-        if "def " in signature and ":" in signature:
-            self.language = "python"
-        elif "package " in signature and "func " in signature:
-            self.language = "go"
-        elif "fn " in signature and "->" in signature:
-            self.language = "rust"
-        elif "public " in signature or "class " in signature:
-            self.language = "java"
-        elif signature.lstrip().startswith("<?php"):
-            self.language = "php"
-        elif detect_language_from_filename(self.name):
-            self.language = detect_language_from_filename(self.name)
+        for impl in self.active_implementations:
+            if impl.language != "plaintext":
+                continue
+            signature = impl.signature or impl.code[:400]
+            if "def " in signature and ":" in signature:
+                impl.language = "python"
+            elif "package " in signature and "func " in signature:
+                impl.language = "go"
+            elif "fn " in signature and "->" in signature:
+                impl.language = "rust"
+            elif "public " in signature or "class " in signature:
+                impl.language = "java"
+            elif signature.lstrip().startswith("<?php"):
+                impl.language = "php"
+            elif detect_language_from_filename(self.name):
+                impl.language = detect_language_from_filename(self.name)
 
 
 __all__ = [
     "Symbol",
+    "FunctionImplementation",
     "Function",
     "SYMBOL_KIND_LABELS",
     "SYMBOL_KIND_ORDER",

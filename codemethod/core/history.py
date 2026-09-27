@@ -86,13 +86,22 @@ def kind_of_snapshot(snapshot: Optional[Dict[str, Any]]) -> str:
     """按快照里出现的关键字段判断它属于哪类实体。
 
     刻意用"看字段"而不是"看标记": 这样旧文件 (没有 kind 字段) 也能正确判断。
+
+    注意函数体与模块现在**都**有 ``implementations``; 区别在于函数体的实现里带
+    ``symbols`` (变量含义表), 模块的实现里没有。
     """
     if not isinstance(snapshot, dict):
         return "module"
-    if snapshot.get("implementations") is not None or "implementations" in snapshot:
-        return "module"
     if "files" in snapshot:
         return "space"
+    if "implementations" in snapshot:
+        for item in snapshot.get("implementations") or []:
+            if isinstance(item, dict) and "symbols" in item:
+                return "function"
+        # 实现列表为空时按顶层字段名兜底: 函数体用 name, 模块用 title
+        if "title" not in snapshot and "name" in snapshot:
+            return "function"
+        return "module"
     if "symbols" in snapshot:
         return "function"
     return "module"
@@ -207,69 +216,126 @@ def _space_diff(
     return chunks
 
 
-def _function_diff(
-    before: Dict[str, Any], after: Dict[str, Any], context: int
-) -> List[str]:
-    """函数体的差异: 共有字段 + 代码 + **变量含义表**的变化。"""
-    chunks: List[str] = []
-    _common_fields_diff(
-        chunks, before, after, title_field="name", title_label="函数名", context=context
-    )
-
-    for field_name, label in (("language", "语言"), ("signature", "函数签名")):
-        old = str(before.get(field_name) or "")
-        new = str(after.get(field_name) or "")
-        if old == new:
+def _implementation_index(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """按实现 id 索引 ``implementations`` (取不到 id 时退回语言 + 序号)。"""
+    out: Dict[str, Dict[str, Any]] = {}
+    for position, impl in enumerate(snapshot.get("implementations") or []):
+        if not isinstance(impl, dict):
             continue
-        chunks.append(f"### {label}")
-        chunks.append(f"-{old or '<空>'}")
-        chunks.append(f"+{new or '<空>'}")
-        chunks.append("")
+        key = str(impl.get("id") or f"{impl.get('language')}#{position}")
+        out[key] = impl
+    return out
 
-    # 变量表: 新增 / 删除 / 含义被填写或修改
-    def index(snapshot: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
-        return {
-            (s.get("kind"), s.get("name")): s
-            for s in (snapshot.get("symbols") or [])
-            if isinstance(s, dict)
-        }
 
-    old_symbols, new_symbols = index(before), index(after)
-    for key in sorted(set(new_symbols) - set(old_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+def _symbol_index(implementation: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
+    return {
+        (s.get("kind"), s.get("name")): s
+        for s in (implementation.get("symbols") or [])
+        if isinstance(s, dict)
+    }
+
+
+def _symbol_diff_chunks(
+    chunks: List[str], prefix: str, before_impl: Dict[str, Any], after_impl: Dict[str, Any]
+) -> None:
+    """变量表的变化: 新增 / 删除 / 含义被填写或修改。"""
+    old_symbols = _symbol_index(before_impl)
+    new_symbols = _symbol_index(after_impl)
+    key_order = lambda k: (str(k[0]), str(k[1]))  # noqa: E731
+
+    for key in sorted(set(new_symbols) - set(old_symbols), key=key_order):
         symbol = new_symbols[key]
-        chunks.append(f"### 新增变量 · {symbol.get('name')} ({symbol.get('kind')})")
+        chunks.append(f"### 新增变量 · {prefix}{symbol.get('name')} ({symbol.get('kind')})")
         if symbol.get("type"):
             chunks.append(f"+类型: {symbol.get('type')}")
         if symbol.get("meaning"):
             chunks.append(f"+含义: {symbol.get('meaning')}")
         chunks.append("")
 
-    for key in sorted(set(old_symbols) - set(new_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+    for key in sorted(set(old_symbols) - set(new_symbols), key=key_order):
         symbol = old_symbols[key]
-        chunks.append(f"### 删除变量 · {symbol.get('name')} ({symbol.get('kind')})")
+        chunks.append(f"### 删除变量 · {prefix}{symbol.get('name')} ({symbol.get('kind')})")
         if symbol.get("meaning"):
             chunks.append(f"-含义: {symbol.get('meaning')}")
         chunks.append("")
 
-    for key in sorted(set(old_symbols) & set(new_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+    for key in sorted(set(old_symbols) & set(new_symbols), key=key_order):
         old_symbol, new_symbol = old_symbols[key], new_symbols[key]
         for field_name, label in (("type", "类型"), ("meaning", "含义")):
             old_val = str(old_symbol.get(field_name) or "")
             new_val = str(new_symbol.get(field_name) or "")
             if old_val == new_val:
                 continue
-            chunks.append(f"### 变量 {new_symbol.get('name')} · {label}")
+            chunks.append(f"### 变量 {prefix}{new_symbol.get('name')} · {label}")
             chunks.append(f"-{old_val or '<空>'}")
             chunks.append(f"+{new_val or '<空>'}")
             chunks.append("")
 
-    code_diff = _unified_diff(
-        str(before.get("code") or ""), str(after.get("code") or ""), "函数体", context
+
+def _function_diff(
+    before: Dict[str, Any], after: Dict[str, Any], context: int
+) -> List[str]:
+    """函数体的差异: 共有字段 + 每种语言实现各自的代码与**变量含义表**变化。"""
+    chunks: List[str] = []
+    _common_fields_diff(
+        chunks, before, after, title_field="name", title_label="函数名", context=context
     )
-    if code_diff:
-        chunks.append("### 代码")
-        chunks.extend(code_diff)
+
+    old_impls = _implementation_index(before)
+    new_impls = _implementation_index(after)
+
+    for impl_id in new_impls.keys() - old_impls.keys():
+        impl = new_impls[impl_id]
+        language = str(impl.get("language") or "?")
+        chunks.append(f"### +++ 新增语言实现 · {language} +++")
+        if impl.get("prerequisites"):
+            chunks.append(f"+前置要求: {impl.get('prerequisites')}")
+        code = str(impl.get("code") or "")
+        if code:
+            chunks.append(f"+代码 {len(code.splitlines())} 行")
         chunks.append("")
+
+    for impl_id in old_impls.keys() - new_impls.keys():
+        impl = old_impls[impl_id]
+        language = str(impl.get("language") or "?")
+        code = str(impl.get("code") or "")
+        chunks.append(f"### --- 删除语言实现 · {language} ---")
+        if code:
+            chunks.append(f"-代码 {len(code.splitlines())} 行")
+        chunks.append("")
+
+    for impl_id in old_impls.keys() & new_impls.keys():
+        old_impl, new_impl = old_impls[impl_id], new_impls[impl_id]
+        language = str(new_impl.get("language") or old_impl.get("language") or "?")
+        prefix = f"[{language}] "
+
+        for field_name, label in (
+            ("language", "语言"),
+            ("signature", "函数签名"),
+            ("prerequisites", "前置要求"),
+            ("notes", "实现说明"),
+        ):
+            old_val = str(old_impl.get(field_name) or "")
+            new_val = str(new_impl.get(field_name) or "")
+            if old_val == new_val:
+                continue
+            chunks.append(f"### {prefix}{label}")
+            chunks.append(f"-{old_val or '<空>'}")
+            chunks.append(f"+{new_val or '<空>'}")
+            chunks.append("")
+
+        _symbol_diff_chunks(chunks, prefix, old_impl, new_impl)
+
+        code_diff = _unified_diff(
+            str(old_impl.get("code") or ""),
+            str(new_impl.get("code") or ""),
+            f"{prefix}代码",
+            context,
+        )
+        if code_diff:
+            chunks.append(f"### {prefix}代码")
+            chunks.extend(code_diff)
+            chunks.append("")
 
     return chunks
 
@@ -429,8 +495,7 @@ def _summarize_space(before: Dict[str, Any], after: Dict[str, Any]) -> str:
 def _summarize_function(before: Dict[str, Any], after: Dict[str, Any]) -> str:
     bits: List[str] = []
     for field_name, label in (("name", "函数名"), ("description", "描述"),
-                              ("prerequisites", "前置要求"), ("language", "语言"),
-                              ("signature", "签名"), ("status", "状态")):
+                              ("prerequisites", "前置要求"), ("status", "状态")):
         if str(before.get(field_name) or "") != str(after.get(field_name) or ""):
             bits.append(label)
 
@@ -441,29 +506,41 @@ def _summarize_function(before: Dict[str, Any], after: Dict[str, Any]) -> str:
             parts.append(f"-{len(removed)}")
         bits.append("标签 " + "/".join(parts))
 
-    def index(snapshot: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
-        return {(s.get("kind"), s.get("name")): s for s in (snapshot.get("symbols") or [])
-                if isinstance(s, dict)}
+    old_impls = _implementation_index(before)
+    new_impls = _implementation_index(after)
 
-    old_symbols, new_symbols = index(before), index(after)
-    if new_symbols.keys() - old_symbols.keys():
-        bits.append(f"新增变量 {len(new_symbols.keys() - old_symbols.keys())}")
-    if old_symbols.keys() - new_symbols.keys():
-        bits.append(f"删除变量 {len(old_symbols.keys() - new_symbols.keys())}")
-    filled = 0
-    for key in old_symbols.keys() & new_symbols.keys():
-        old_meaning = str(old_symbols[key].get("meaning") or "")
-        new_meaning = str(new_symbols[key].get("meaning") or "")
-        if old_meaning != new_meaning:
-            filled += 1
-    if filled:
-        bits.append(f"{filled} 个变量含义变更")
+    for impl_id in new_impls.keys() - old_impls.keys():
+        bits.append(f"新增 {new_impls[impl_id].get('language')} 实现")
+    for impl_id in old_impls.keys() - new_impls.keys():
+        bits.append(f"删除 {old_impls[impl_id].get('language')} 实现")
 
-    old_code = str(before.get("code") or "")
-    new_code = str(after.get("code") or "")
-    if old_code != new_code:
-        plus, minus = _count_line_changes(old_code, new_code)
-        bits.append(f"代码 +{plus}/-{minus}")
+    for impl_id in sorted(old_impls.keys() & new_impls.keys()):
+        old_impl, new_impl = old_impls[impl_id], new_impls[impl_id]
+        language = str(new_impl.get("language") or old_impl.get("language") or "?")
+        for field_name, label in (("language", "语言"), ("signature", "签名"),
+                                  ("prerequisites", "前置要求"), ("notes", "实现说明")):
+            if str(old_impl.get(field_name) or "") != str(new_impl.get(field_name) or ""):
+                bits.append(f"{language} {label}")
+
+        old_symbols = _symbol_index(old_impl)
+        new_symbols = _symbol_index(new_impl)
+        if new_symbols.keys() - old_symbols.keys():
+            bits.append(f"{language} 新增变量 {len(new_symbols.keys() - old_symbols.keys())}")
+        if old_symbols.keys() - new_symbols.keys():
+            bits.append(f"{language} 删除变量 {len(old_symbols.keys() - new_symbols.keys())}")
+        filled = 0
+        for key in old_symbols.keys() & new_symbols.keys():
+            if str(old_symbols[key].get("meaning") or "") != str(new_symbols[key].get("meaning") or ""):
+                filled += 1
+        if filled:
+            bits.append(f"{language} {filled} 个变量含义变更")
+
+        old_code = str(old_impl.get("code") or "")
+        new_code = str(new_impl.get("code") or "")
+        if old_code != new_code:
+            plus, minus = _count_line_changes(old_code, new_code)
+            bits.append(f"{language} 代码 +{plus}/-{minus}")
+
     return ", ".join(bits) if bits else "无实质变更"
 
 

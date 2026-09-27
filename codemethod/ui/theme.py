@@ -791,6 +791,24 @@ QTextBrowser, QTextEdit#DiffView, QPlainTextEdit#DiffView {{
     font-family: "{t.mono_font_family}", Consolas, monospace;
 }}
 #HistoryList::item {{ padding: 5px 6px; }}
+#DeletedNotice {{
+    background-color: {t.warning};
+    border-bottom: 1px solid {t.border};
+}}
+#DeletedNotice QLabel {{
+    color: {t.editor};
+    font-weight: bold;
+    background: transparent;
+}}
+#DeletedNotice QPushButton {{
+    background-color: {t.editor};
+    color: {t.warning};
+    border: none;
+    border-radius: 3px;
+    padding: 3px 12px;
+    font-weight: bold;
+}}
+#DeletedNotice QPushButton:hover {{ background-color: {t.sidebar_section}; }}
 #TagChip {{
     border-radius: 9px;
     padding: 1px 8px;

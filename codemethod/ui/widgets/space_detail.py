@@ -34,6 +34,8 @@ from ...core.spaces import ProjectFile, Space, TreeNode
 from ..editor import CodePreview
 from ..theme import DEFAULT_THEME, Theme
 from .language_bar import LanguageBar, LanguageLegend
+from .action_button import fit_action_button
+from .deleted_notice import DeletedNotice
 from .tag_chip import TagChipBar
 
 
@@ -113,6 +115,8 @@ class SpaceDetailPanel(QWidget):
     delete_file_requested = Signal(str, str)
     add_directory_requested = Signal(str)
     rename_file_requested = Signal(str, str)
+    restore_requested = Signal(str)
+    purge_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
@@ -124,6 +128,15 @@ class SpaceDetailPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        self._deleted_notice = DeletedNotice(self)
+        self._deleted_notice.restore_requested.connect(
+            lambda: self._space and self.restore_requested.emit(self._space.id)
+        )
+        self._deleted_notice.purge_requested.connect(
+            lambda: self._space and self.purge_requested.emit(self._space.id)
+        )
+        root.addWidget(self._deleted_notice)
 
         self._empty = QLabel(
             "选择左侧的一个空间以查看项目结构\n\n"
@@ -197,7 +210,12 @@ class SpaceDetailPanel(QWidget):
         self._meta.setObjectName("DimLabel")
         info.addWidget(self._meta)
         info.addStretch(1)
+        layout.addLayout(info)
 
+        # 动作按钮单独占一行, 避免窄面板下按钮文字被压缩
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        actions.addStretch(1)
         self._edit_button = QPushButton("编辑", header)
         self._edit_button.clicked.connect(
             lambda: self._space and self.edit_requested.emit(self._space.id)
@@ -220,11 +238,11 @@ class SpaceDetailPanel(QWidget):
         self._more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._build_more_menu()
 
-        info.addWidget(self._edit_button)
-        info.addWidget(self._history_button)
-        info.addWidget(self._add_file_button)
-        info.addWidget(self._more_button)
-        layout.addLayout(info)
+        for button in (self._edit_button, self._history_button, self._add_file_button):
+            fit_action_button(button)
+            actions.addWidget(button)
+        actions.addWidget(self._more_button)
+        layout.addLayout(actions)
 
         divider = QFrame(header)
         divider.setFrameShape(QFrame.Shape.HLine)
@@ -535,6 +553,30 @@ class SpaceDetailPanel(QWidget):
         self._show_file(path)
         self.tabs.setCurrentIndex(1)
 
+    def set_deleted_notice(self, is_deleted: bool) -> None:
+        """对象在回收站里时, 顶部显示恢复提示条。"""
+        self._deleted_notice.setVisible(bool(is_deleted))
+
+    def copy_current_file(self) -> None:
+        """把当前预览的文件内容复制到剪贴板 (供主窗口的「复制代码」调用)。"""
+        from PySide6.QtWidgets import QApplication
+
+        if self._space is None or not self._preview_path:
+            self.copy_done.emit("请先在项目树里选中一个文件")
+            return
+        file = self._space.get_file(self._preview_path)
+        if file is None:
+            self.copy_done.emit("文件不存在")
+            return
+        if file.binary:
+            self.copy_done.emit(f"{file.path} 是二进制文件, 只记录了大小, 无法复制内容")
+            return
+        QApplication.clipboard().setText(file.content)
+        self.copy_done.emit(
+            f"已复制 {file.path} ({len(file.content.splitlines())} 行, "
+            f"{len(file.content)} 字符) 到剪贴板"
+        )
+
     def current_space(self) -> Optional[Space]:
         return self._space
 
@@ -543,6 +585,8 @@ class SpaceDetailPanel(QWidget):
         self.preview.editor.set_theme(theme)
         self.language_bar.set_theme(theme)
         self.language_legend.set_theme(theme)
+        for button in (self._edit_button, self._history_button, self._add_file_button):
+            fit_action_button(button)
 
 
 __all__ = ["SpaceDetailPanel", "SpaceTree"]

@@ -34,6 +34,7 @@ from ...core.languages import get_language
 from ...core.models import STATUS_COLORS, STATUS_LABELS, Entry, format_ts
 from ..editor import CodePreview
 from ..theme import DEFAULT_THEME, Theme
+from .deleted_notice import DeletedNotice
 from .tag_chip import TagChipBar
 
 
@@ -133,6 +134,8 @@ class DetailPanel(QWidget):
     add_implementation_requested = Signal(str)            # (entry_id)
     edit_implementation_requested = Signal(str, str)      # (entry_id, implementation_id)
     delete_implementation_requested = Signal(str, str)    # (entry_id, implementation_id)
+    restore_requested = Signal(str)
+    purge_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
@@ -146,6 +149,15 @@ class DetailPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        self._deleted_notice = DeletedNotice(self)
+        self._deleted_notice.restore_requested.connect(
+            lambda: self._entry and self.restore_requested.emit(self._entry.id)
+        )
+        self._deleted_notice.purge_requested.connect(
+            lambda: self._entry and self.purge_requested.emit(self._entry.id)
+        )
+        root.addWidget(self._deleted_notice)
 
         # ---------- 空状态 ----------
         self._empty = QLabel(
@@ -442,6 +454,10 @@ class DetailPanel(QWidget):
         self.delete_implementation_requested.emit(self._entry.id, implementation_id)
 
     # ----------------------------------------------------------------------------
+    def set_deleted_notice(self, is_deleted: bool) -> None:
+        """对象在回收站里时, 顶部显示恢复提示条。"""
+        self._deleted_notice.setVisible(bool(is_deleted))
+
     def set_entry(self, entry: Optional[Entry], *, tag_colors: Optional[Dict[str, str]] = None) -> None:
         if tag_colors is not None:
             self._tag_colors = {k.casefold(): v for k, v in tag_colors.items()}

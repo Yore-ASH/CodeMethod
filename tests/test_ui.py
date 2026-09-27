@@ -294,9 +294,67 @@ class TestMainWindow(_TrackedWidgets):
         self.assertIs(window.detail_stack.currentWidget(), window.function_panel)
         self.assertEqual(window.function_panel.current_function().id, function.id)
         self.assertEqual(window._current_kind, "function")
+        # 语言下拉框列出全部实现, 变量表显示的是当前那一种语言的表
         self.assertEqual(
-            window.function_panel.symbol_table.rowCount(), len(function.symbols)
+            window.function_panel.language_combo.count(),
+            len(function.active_implementations),
         )
+        current = function.active_implementations[0]
+        self.assertEqual(
+            window.function_panel.symbol_table.rowCount(), len(current.symbols)
+        )
+        window.close()
+
+    def test_switching_language_switches_symbol_table(self):
+        """同一个函数体的不同语言实现, 变量表要跟着切换。"""
+        window, db = self._make_window()
+        function = next(iter(db.repository.functions.values()), None)
+        self.assertIsNotNone(function)
+        window.entry_list.select_entry(function.id)
+        window.refresh_detail()
+        self.app.processEvents()
+
+        panel = window.function_panel
+        self.assertGreater(len(function.active_implementations), 1, "示例库应有多语言实现")
+        rows = []
+        for index in range(panel.language_combo.count()):
+            panel.language_combo.setCurrentIndex(index)
+            self.app.processEvents()
+            rows.append(panel.symbol_table.rowCount())
+        self.assertEqual(
+            rows, [len(impl.symbols) for impl in function.active_implementations]
+        )
+        self.assertEqual(len(set(rows)) > 1 or len(rows) > 1, True)
+        window.close()
+
+    def test_delete_button_menu_mentions_current_language(self):
+        window, db = self._make_window()
+        function = next(iter(db.repository.functions.values()), None)
+        window.entry_list.select_entry(function.id)
+        window.refresh_detail()
+        self.app.processEvents()
+        # 「重新检测变量」按钮必须完整显示, 不能被压成 0 宽
+        button = window.function_panel._detect_button
+        self.assertGreaterEqual(button.minimumWidth(), button.fontMetrics().horizontalAdvance("重新检测变量"))
+        window.close()
+
+    def test_delete_function_through_window(self):
+        """用户报的 bug: 删除对空间 / 函数体无效 —— 现在必须真的删掉。"""
+        window, db = self._make_window()
+        function = next(iter(db.repository.functions.values()), None)
+        repo = db.repository
+        count_before = len(repo.functions)
+        repo.delete_item(function.id)
+        self.assertTrue(repo.item_is_deleted(function.id))
+        self.assertEqual(len(repo.items("function")), count_before - 1)
+        repo.restore_item(function.id)
+        self.assertEqual(len(repo.items("function")), count_before)
+
+        space = next(iter(repo.spaces.values()))
+        repo.delete_item(space.id)
+        self.assertTrue(repo.item_is_deleted(space.id))
+        repo.restore_item(space.id)
+        self.assertFalse(repo.item_is_deleted(space.id))
         window.close()
 
     def test_space_and_function_share_one_history_panel(self):

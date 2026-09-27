@@ -187,13 +187,19 @@ def full_text_blob(
         if search_description:
             parts.append(item.description)
             parts.append(item.prerequisites)
-            parts.append(item.signature)
-            for symbol in item.symbols:
+        for impl in item.active_implementations:
+            # 每种语言实现都有自己的签名 / 前置要求 / 变量含义 / 代码
+            parts.append(impl.language)
+            parts.append(impl.language_name)
+            parts.append(impl.signature)
+            parts.append(impl.notes)
+            parts.append(impl.prerequisites)
+            for symbol in impl.symbols:
                 parts.append(symbol.name)
                 parts.append(symbol.type)
                 parts.append(symbol.meaning)
-        if search_code:
-            parts.append(item.code)
+            if search_code:
+                parts.append(impl.code)
         return "\n".join(p for p in parts if p).casefold()
 
     # 模块
@@ -215,7 +221,7 @@ def prerequisites_blob(item: Any) -> str:
     """通用前置要求 + 各语言前置要求 的合并文本 (小写)。"""
     kind = getattr(item, "kind", "module")
     parts = [getattr(item, "prerequisites", "") or ""]
-    if kind == "module":
+    if kind in ("module", "function"):
         parts.extend(impl.prerequisites for impl in item.active_implementations)
     return "\n".join(p for p in parts if p).casefold()
 

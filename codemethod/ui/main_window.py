@@ -42,7 +42,8 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_NAME, APP_VERSION
-from ..core.languages import get_language
+from ..core.functions import FunctionImplementation
+from ..core.languages import get_language, language_choices, normalize_language
 from ..core.models import STATUS_LABELS, STATUS_ORDER, Entry, format_ts
 from ..core.query import QuerySpec, TagMatch, query_entries, related_tags
 from ..core.repository import Repository, RepositoryError
@@ -646,7 +647,24 @@ class MainWindow(QMainWindow):
         self.function_panel.duplicate_requested.connect(lambda _id: self.duplicate_entry())
         self.function_panel.export_requested.connect(self.on_export_requested)
         self.function_panel.copy_done.connect(self.set_status)
-        self.function_panel.redetect_requested.connect(lambda _id: self.redetect_symbols())
+        self.function_panel.redetect_requested.connect(
+            lambda fid, iid: self.redetect_symbols(fid, iid)
+        )
+        self.function_panel.add_implementation_requested.connect(
+            lambda fid: self.add_function_implementation(fid)
+        )
+        self.function_panel.edit_implementation_requested.connect(
+            lambda fid, iid: self.edit_function_implementation(fid, iid)
+        )
+        self.function_panel.delete_implementation_requested.connect(
+            lambda fid, iid: self.delete_function_implementation(fid, iid)
+        )
+        self.function_panel.restore_requested.connect(lambda _id: self.restore_entry())
+        self.function_panel.purge_requested.connect(lambda _id: self.purge_entry())
+        self.space_panel.restore_requested.connect(lambda _id: self.restore_entry())
+        self.space_panel.purge_requested.connect(lambda _id: self.purge_entry())
+        self.detail_panel.restore_requested.connect(lambda _id: self.restore_entry())
+        self.detail_panel.purge_requested.connect(lambda _id: self.purge_entry())
 
         self.history_panel.restore_requested.connect(self.restore_revision)
         self.history_panel.undo_requested.connect(lambda _id: self.undo())
@@ -690,18 +708,26 @@ class MainWindow(QMainWindow):
         entries = query_entries(self.db.repository, self.query)
 
         # 重建期间抑制选中信号: 模型 reset 会产生"先失效再选中"的中间态, 没有必要反复重建详情
+        found = True
         self._suppress_selection_signal = True
         try:
             self.entry_list.set_entries(
                 entries, revision_counts=revision_counts, tag_colors=tag_colors
             )
             if select_id:
-                self.entry_list.select_entry(select_id)
+                found = self.entry_list.select_entry(select_id)
         finally:
             self._suppress_selection_signal = False
 
-        # 以列表真实的选中项为准, 保证 _current_entry_id 与界面高亮永远一致
+        # 以列表真实的选中项为准, 保证 _current_entry_id 与界面高亮永远一致。
+        # 唯一的例外: 显式点名了 select_id 却在列表里找不到它, 而库里**还有**这个对象
+        # (只是被软删除了) —— 这时保留它, 详情面板才能显示"在回收站里"并让人恢复。
+        # 纯粹被检索条件过滤掉的项不在此列, 那种情况详情面板应当清空。
         self._current_entry_id = self.entry_list.current_entry_id()
+        if select_id and not found:
+            candidate = self.db.repository.get_item(select_id)
+            if candidate is not None and candidate.deleted:
+                self._current_entry_id = select_id
         self.update_status_counts(len(entries))
 
         if sync_detail:
@@ -736,7 +762,23 @@ class MainWindow(QMainWindow):
         else:
             self.detail_stack.setCurrentWidget(self.detail_panel)
             self.detail_panel.set_entry(item, tag_colors=tag_colors)
+
+        # 当前对象在回收站里时明确提示, 并让「恢复」触手可及
+        if item is not None:
+            self._sync_deleted_banner(item)
         self.refresh_history()
+
+    def _sync_deleted_banner(self, item) -> None:
+        is_deleted = bool(item.deleted)
+        for panel in (self.detail_panel, self.space_panel, self.function_panel):
+            setter = getattr(panel, "set_deleted_notice", None)
+            if setter is not None:
+                setter(is_deleted)
+        if is_deleted:
+            self.set_status(
+                f"《{item.display_title}》在回收站里 —— 用「编辑 → 从回收站恢复」或顶部提示条恢复",
+                timeout=0,
+            )
 
     def refresh_history(self) -> None:
         if self._tearing_down:
@@ -804,7 +846,7 @@ class MainWindow(QMainWindow):
         self.act_edit_entry.setEnabled(has_item and kind == "module")
         self.act_add_impl.setEnabled(has_item and kind == "module")
         self.act_edit_impl.setEnabled(has_item and kind == "module")
-        self.act_copy_code.setEnabled(has_item and kind == "module")
+        self.act_copy_code.setEnabled(has_item and not (item and item.deleted))
         self.act_edit_space.setEnabled(has_item and kind == "space")
         self.act_edit_function.setEnabled(has_item and kind == "function")
         self.act_redetect_symbols.setEnabled(has_item and kind == "function")
@@ -964,80 +1006,85 @@ class MainWindow(QMainWindow):
             self.set_status("内容没有变化, 未产生新的修订")
 
     def duplicate_entry(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
-        clone = self.db.repository.duplicate_entry(entry.id)
+        clone = self.db.repository.duplicate_item(item.id)
         self._current_entry_id = clone.id
+        self._current_kind = clone.kind
         self.refresh_all(select_id=clone.id)
         self.set_status(f"已创建副本《{clone.display_title}》")
 
     def delete_entry(self) -> None:
-        entry = self._current_entry()
-        if entry is None or entry.deleted:
+        """删除当前对象 (软删除进回收站) —— 三类实体通用。"""
+        item = self._current_item()
+        if item is None:
+            return
+        if item.deleted:
+            self.set_status("该对象已经在回收站里了")
             return
         answer = QMessageBox.question(
             self,
-            "删除条目",
-            f"确定把《{entry.display_title}》移入回收站吗?\n\n"
-            "条目与全部实现都会被保留在历史中, 可以随时从回收站恢复或回滚。",
+            f"删除{item.kind_label}",
+            f"确定把{item.kind_label}《{item.display_title}》移入回收站吗?\n\n"
+            "内容与全部实现都会保留在历史中, 可以随时从回收站恢复或回滚。",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.db.repository.delete_entry(entry.id)
-        self.refresh_all(select_id=entry.id)
-        self.set_status(f"《{entry.display_title}》已移入回收站 (可在历史中恢复)")
+        self.db.repository.delete_item(item.id)
+        self.refresh_all(select_id=item.id)
+        self.set_status(f"《{item.display_title}》已移入回收站 (可在历史中恢复)")
 
     def restore_entry(self) -> None:
-        entry = self._current_entry()
-        if entry is None or not entry.deleted:
+        item = self._current_item()
+        if item is None or not item.deleted:
             return
-        self.db.repository.restore_entry(entry.id)
-        self.refresh_all(select_id=entry.id)
-        self.set_status(f"《{entry.display_title}》已从回收站恢复")
+        self.db.repository.restore_item(item.id)
+        self.refresh_all(select_id=item.id)
+        self.set_status(f"《{item.display_title}》已从回收站恢复")
 
     def purge_entry(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
         answer = QMessageBox.warning(
             self,
             "彻底删除",
-            f"将**彻底删除**《{entry.display_title}》及其全部实现。\n\n"
-            "历史记录仍会保留一条删除记录, 但条目本体不再显示。\n确定继续吗?",
+            f"将**彻底删除**{item.kind_label}《{item.display_title}》及其全部内容。\n\n"
+            "历史记录仍会保留一条删除记录, 但对象本体不再显示。\n确定继续吗?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.db.repository.delete_entry(entry.id, hard=True)
+        self.db.repository.delete_item(item.id, hard=True)
         self._current_entry_id = ""
         self.refresh_all()
-        self.set_status(f"《{entry.display_title}》已彻底删除")
+        self.set_status(f"《{item.display_title}》已彻底删除")
 
     def toggle_favorite(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
-        self.db.repository.toggle_favorite(entry.id)
-        self.refresh_all(select_id=entry.id)
+        self.db.repository.toggle_favorite_item(item.id)
+        self.refresh_all(select_id=item.id)
         self.set_status("已更新收藏状态")
 
     def set_planning_status(self) -> None:
-        """设置当前条目在规划流程中的阶段。"""
-        entry = self._current_entry()
-        if entry is None:
+        """设置当前对象在规划流程中的阶段 (三类实体通用)。"""
+        item = self._current_item()
+        if item is None:
             return
         labels = [STATUS_LABELS[s] for s in STATUS_ORDER]
-        current = STATUS_ORDER.index(entry.status) if entry.status in STATUS_ORDER else 0
+        current = STATUS_ORDER.index(item.status) if item.status in STATUS_ORDER else 0
         label, ok = QInputDialog.getItem(
-            self, "设置规划状态", "选择该条目所处的规划阶段:", labels, current, False
+            self, "设置规划状态", "选择该对象所处的规划阶段:", labels, current, False
         )
         if not ok:
             return
         status = STATUS_ORDER[labels.index(label)]
-        self.db.repository.update_entry(entry.id, status=status)
-        self.refresh_all(select_id=entry.id)
+        self.db.repository.set_item_status(item.id, status)
+        self.refresh_all(select_id=item.id)
         self.set_status(f"状态已更新为「{STATUS_LABELS[status]}」")
 
     def set_status(self, message: str, timeout: int = 6000) -> None:
@@ -1053,29 +1100,29 @@ class MainWindow(QMainWindow):
     # 撤销 / 重做 / 回滚
     # ==================================================================================
     def undo(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
-        if not self.db.repository.can_undo(entry.id):
+        if not self.db.repository.can_undo(item.id):
             self.set_status("已经是最早的版本, 无法继续撤销")
             return
-        result = self.db.repository.undo(entry.id)
-        self.refresh_all(select_id=entry.id)
+        result = self.db.repository.undo(item.id)
+        self.refresh_all(select_id=item.id)
         if result is not None:
             self.set_status(
-                f"已撤销到 {format_ts(self.db.repository.history.current_revision(entry.id).timestamp)} "
+                f"已撤销到 {format_ts(self.db.repository.history.current_revision(item.id).timestamp)} "
                 f"的版本 (历史记录未被删除)"
             )
 
     def redo(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
-        if not self.db.repository.can_redo(entry.id):
+        if not self.db.repository.can_redo(item.id):
             self.set_status("已经是最新的版本")
             return
-        result = self.db.repository.redo(entry.id)
-        self.refresh_all(select_id=entry.id)
+        result = self.db.repository.redo(item.id)
+        self.refresh_all(select_id=item.id)
         if result is not None:
             self.set_status("已重做到下一条修订")
 
@@ -1207,8 +1254,8 @@ class MainWindow(QMainWindow):
         self.refresh_all(select_id=self._current_entry_id)
 
     def add_tag_to_current(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
         text, ok = QInputDialog.getText(
             self,
@@ -1218,9 +1265,9 @@ class MainWindow(QMainWindow):
         )
         if not ok or not text.strip():
             return
-        new_tags = list(entry.tags) + text.replace(",", " ").replace("，", " ").split()
-        self.db.repository.update_entry(entry.id, tags=new_tags)
-        self.refresh_all(select_id=entry.id)
+        new_tags = list(item.tags) + text.replace(",", " ").replace("，", " ").split()
+        self.db.repository.set_item_tags(item.id, new_tags)
+        self.refresh_all(select_id=item.id)
         self.set_status(f"已更新标签: {', '.join('#' + t for t in new_tags)}")
 
     def on_tag_context_menu(self, tag: str, global_pos) -> None:
@@ -1515,15 +1562,13 @@ class MainWindow(QMainWindow):
         if dialog.exec() != FunctionEditorDialog.DialogCode.Accepted:
             return
         data = dialog.result_data()
+        implementations = list(data["implementations"])
         try:
             function = self.db.repository.create_function(
                 str(data["name"]),
-                str(data["language"]),
-                str(data["code"]),
-                signature=str(data["signature"]),
+                implementations=implementations,
                 description=str(data["description"]),
                 prerequisites=str(data["prerequisites"]),
-                symbols=list(data["symbols"]),
                 tags=list(data["tags"]),
                 status=str(data["status"]),
                 favorite=bool(data["favorite"]),
@@ -1536,11 +1581,9 @@ class MainWindow(QMainWindow):
         self._current_entry_id = function.id
         self._current_kind = "function"
         self.refresh_all(select_id=function.id)
-        missing = len(function.required_symbols_missing_meaning)
         self.set_status(
-            f"已新建函数体《{function.display_title}》({function.language_name}) · "
-            f"{len(function.symbols)} 个变量"
-            + (f" · {missing} 个待填含义" if missing else " · 含义已完整")
+            f"已新建函数体《{function.display_title}》· {function.badge_label} · "
+            f"{function.meanings_summary}"
         )
 
     def edit_function(self, function_id: str = "") -> None:
@@ -1561,12 +1604,9 @@ class MainWindow(QMainWindow):
             updated = self.db.repository.update_function(
                 function.id,
                 name=str(data["name"]),
-                language=str(data["language"]),
-                code=str(data["code"]),
-                signature=str(data["signature"]),
                 description=str(data["description"]),
                 prerequisites=str(data["prerequisites"]),
-                symbols=list(data["symbols"]),
+                implementations=list(data["implementations"]),
                 tags=list(data["tags"]),
                 status=str(data["status"]),
                 favorite=bool(data["favorite"]),
@@ -1575,10 +1615,114 @@ class MainWindow(QMainWindow):
             self.show_error("保存函数体失败", str(exc))
             return
         self.refresh_all(select_id=function.id)
-        missing = len(updated.required_symbols_missing_meaning)
         self.set_status(
-            f"已保存函数体《{updated.display_title}》· {len(updated.symbols)} 个变量"
-            + (f" · {missing} 个待填含义" if missing else " · 含义已完整")
+            f"已保存函数体《{updated.display_title}》· {updated.badge_label} · "
+            f"{updated.meanings_summary}"
+        )
+
+    def add_function_implementation(self, function_id: str = "") -> None:
+        """给已有函数体再加一种语言的实现。"""
+        function = self._current_function(function_id)
+        if function is None:
+            self.set_status("请先选中一个函数体")
+            return
+        used = set(function.languages)
+        default = next(
+            (lang for lang, _name in language_choices() if lang not in used), "plaintext"
+        )
+        dialog = FunctionEditorDialog(
+            self,
+            function=function,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+            default_language=default,
+            initial_implementation=FunctionImplementation(
+                language=normalize_language(default)
+            ),
+        )
+        if dialog.exec() != FunctionEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        try:
+            updated = self.db.repository.update_function(
+                function.id,
+                name=str(data["name"]),
+                description=str(data["description"]),
+                prerequisites=str(data["prerequisites"]),
+                implementations=list(data["implementations"]),
+                tags=list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+            )
+        except RepositoryError as exc:
+            self.show_error("添加语言实现失败", str(exc))
+            return
+        self.refresh_all(select_id=function.id)
+        self.set_status(
+            f"《{updated.display_title}》现在有 {updated.badge_label} · {updated.meanings_summary}"
+        )
+
+    def edit_function_implementation(self, function_id: str, implementation_id: str) -> None:
+        """只编辑某一种语言的实现 (对话框切到那一种语言, 其它语言保持不变)。"""
+        function = self._current_function(function_id)
+        if function is None:
+            return
+        impl = function.get_implementation(implementation_id)
+        if impl is None:
+            self.set_status("该语言实现不存在")
+            return
+        dialog = FunctionEditorDialog(
+            self,
+            function=function,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+        )
+        dialog.pane.set_implementation(impl)
+        dialog._focus_implementation(impl)
+        if dialog.exec() != FunctionEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        try:
+            updated = self.db.repository.update_function(
+                function.id,
+                name=str(data["name"]),
+                description=str(data["description"]),
+                prerequisites=str(data["prerequisites"]),
+                implementations=list(data["implementations"]),
+                tags=list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+            )
+        except RepositoryError as exc:
+            self.show_error("保存语言实现失败", str(exc))
+            return
+        self.refresh_all(select_id=function.id)
+        self.function_panel.show_implementation(implementation_id)
+        self.set_status(f"已保存 {get_language(impl.language).name} 实现")
+
+    def delete_function_implementation(self, function_id: str, implementation_id: str) -> None:
+        function = self._current_function(function_id)
+        if function is None:
+            return
+        impl = function.get_implementation(implementation_id)
+        if impl is None or impl.deleted:
+            return
+        if len(function.active_implementations) <= 1:
+            self.set_status("至少要保留一种语言的实现; 要删除整个函数体请用「删除函数体」")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除语言实现",
+            f"确定删除《{function.display_title}》的 {get_language(impl.language).name} 实现吗?\n\n"
+            "只影响这一种语言, 其它语言的实现不受影响; 操作会记入历史, 可以恢复。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.db.repository.delete_function_implementation(function.id, impl.id)
+        self.refresh_all(select_id=function.id)
+        self.set_status(
+            f"已删除 {get_language(impl.language).name} 实现 — 还剩 "
+            f"{len(self.db.repository.require_function(function.id).active_implementations)} 种语言"
         )
 
     def _current_function(self, function_id: str = ""):
@@ -1589,26 +1733,58 @@ class MainWindow(QMainWindow):
             return item
         return None
 
-    def redetect_symbols(self, function_id: str = "") -> None:
+    def redetect_symbols(self, function_id: str = "", implementation_id: str = "") -> None:
         function = self._current_function(function_id)
         if function is None:
             self.set_status("请先选中一个函数体")
             return
-        added, updated = self.db.repository.detect_function_symbols(function.id)
+        added, updated = self.db.repository.detect_function_symbols(
+            function.id, implementation_id
+        )
         self.refresh_all(select_id=function.id)
-        missing = len(updated.required_symbols_missing_meaning)
+        if implementation_id:
+            self.function_panel.show_implementation(implementation_id)
+        scope = (
+            get_language(updated.get_implementation(implementation_id).language).name
+            if implementation_id and updated.get_implementation(implementation_id)
+            else f"{len(updated.active_implementations)} 种语言"
+        )
         self.set_status(
-            f"检测完成: 新增 {added} 个变量, 共 {len(updated.symbols)} 个"
-            + (f" · {missing} 个必填项待填写" if missing else " · 含义已完整")
-            + " (已填写的含义保持不变)"
+            f"检测完成 ({scope}): 新增 {added} 个变量, 共 {updated.total_symbols} 个 · "
+            f"{updated.meanings_summary} (已填写的含义保持不变)"
         )
 
     # ==================================================================================
     # 复制 / 导出
     # ==================================================================================
     def copy_current_code(self) -> None:
-        """复制当前详情页签对应语言的实现 (不依赖私有控件下标)。"""
-        entry = self._current_entry()
+        """复制当前选中对象的代码 —— 模块 / 空间 / 函数体三类都支持。"""
+        item = self._current_item()
+        if item is None:
+            return
+        kind = getattr(item, "kind", "module")
+
+        if kind == "space":
+            self.space_panel.copy_current_file()
+            return
+
+        if kind == "function":
+            impl_id = self.function_panel.current_implementation_id()
+            impl = item.get_implementation(impl_id) if impl_id else None
+            if impl is None or impl.deleted:
+                actives = item.active_implementations
+                if not actives:
+                    self.set_status("该函数体还没有任何语言实现, 用「＋ 语言实现」添加")
+                    return
+                impl = actives[0]
+            QApplication.clipboard().setText(impl.code)
+            self.set_status(
+                f"已复制 {get_language(impl.language).name} 实现 "
+                f"({impl.line_count} 行, {len(impl.code)} 字符) 到剪贴板"
+            )
+            return
+
+        entry = item if isinstance(item, Entry) else None
         if entry is None:
             return
         impl_id = self.detail_panel.current_implementation_id()
@@ -1627,16 +1803,27 @@ class MainWindow(QMainWindow):
         )
 
     def copy_entry_as(self, fmt: str) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        item = self._current_item()
+        if item is None:
             return
-        revisions = self.db.repository.revisions(entry.id, descending=False)
+        revisions = self.db.repository.revisions(item.id, descending=False)
+        kind = getattr(item, "kind", "module")
         if fmt == "json":
-            text = exporter.entry_to_json(entry, revisions=revisions)
+            if kind == "space":
+                text = exporter.space_to_json(item, revisions=revisions)
+            elif kind == "function":
+                text = exporter.function_to_json(item, revisions=revisions)
+            else:
+                text = exporter.entry_to_json(item, revisions=revisions)
         else:
-            text = exporter.entry_to_markdown(entry, revisions=revisions)
+            if kind == "space":
+                text = exporter.space_to_markdown(item, revisions=revisions)
+            elif kind == "function":
+                text = exporter.function_to_markdown(item, revisions=revisions)
+            else:
+                text = exporter.entry_to_markdown(item, revisions=revisions)
         QApplication.clipboard().setText(text)
-        self.set_status(f"已复制条目的 {fmt.upper()} 表示 ({len(text)} 字符) 到剪贴板")
+        self.set_status(f"已复制{item.kind_label}的 {fmt.upper()} 表示 ({len(text)} 字符) 到剪贴板")
 
     def on_export_requested(self, entry_id: str, fmt: str) -> None:
         self._current_entry_id = entry_id
@@ -2018,10 +2205,16 @@ class MainWindow(QMainWindow):
     # ==================================================================================
     # 辅助
     # ==================================================================================
-    def _current_entry(self) -> Optional[Entry]:
+    def _current_item(self):
+        """当前选中的对象 —— 可能是模块 / 独立空间 / 函数体中的任意一种。"""
         if not self._current_entry_id:
             return None
-        return self.db.repository.get(self._current_entry_id)
+        return self.db.repository.get_item(self._current_entry_id)
+
+    def _current_entry(self) -> Optional[Entry]:
+        """当前选中的**模块**; 选中的是空间或函数体时返回 None。"""
+        item = self._current_item()
+        return item if isinstance(item, Entry) else None
 
     def _restore_geometry(self) -> None:
         geometry = self.settings.value("geometry")

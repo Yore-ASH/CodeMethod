@@ -282,20 +282,36 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             }
         )
 
-    # ---- 函数体 ----
+    # ---- 函数体: 同一个函数可以有多语言实现, 每种实现有自己的变量含义表 ----
     functions = repository_data.get("functions") or []
     function_index: List[Dict[str, Any]] = []
     symbol_total = 0
     symbol_missing = 0
+    function_impl_total = 0
     for function in functions:
         if not isinstance(function, dict):
             continue
-        symbols = [s for s in (function.get("symbols") or []) if isinstance(s, dict)]
-        symbol_total += len(symbols)
-        symbol_missing += sum(1 for s in symbols if not str(s.get("meaning") or "").strip())
-        lang = str(function.get("language") or "")
-        if lang:
-            language_counter[lang] = language_counter.get(lang, 0) + 1
+        implementations = [
+            impl for impl in (function.get("implementations") or []) if isinstance(impl, dict)
+        ]
+        symbol_count = 0
+        missing_count = 0
+        languages: List[str] = []
+        for impl in implementations:
+            symbols = [s for s in (impl.get("symbols") or []) if isinstance(s, dict)]
+            symbol_count += len(symbols)
+            missing_count += sum(
+                1 for s in symbols
+                if str(s.get("kind") or "") in ("parameter", "field", "return")
+                and not str(s.get("meaning") or "").strip()
+            )
+            lang = str(impl.get("language") or "")
+            if lang:
+                languages.append(lang)
+                language_counter[lang] = language_counter.get(lang, 0) + 1
+        symbol_total += symbol_count
+        symbol_missing += missing_count
+        function_impl_total += len(implementations)
         for tag in function.get("tags") or []:
             tag_counter[str(tag)] = tag_counter.get(str(tag), 0) + 1
         function_index.append(
@@ -305,11 +321,9 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
                 "title": function.get("name"),
                 "status": function.get("status"),
                 "tags": list(function.get("tags") or []),
-                "languages": [lang] if lang else [],
-                "symbol_count": len(symbols),
-                "symbols_missing_meaning": sum(
-                    1 for s in symbols if not str(s.get("meaning") or "").strip()
-                ),
+                "languages": languages,
+                "symbol_count": symbol_count,
+                "symbols_missing_meaning": missing_count,
                 "deleted": bool(function.get("deleted")),
                 "updated_at": function.get("updated_at"),
                 "revisions": len((timelines or {}).get(function.get("id"), []) or []),
@@ -325,7 +339,10 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
         "stats": {
             "entries": len(index),
             "deleted_entries": sum(1 for item in index if item["deleted"]),
-            "implementations": sum(len(i.get("implementations") or []) for i in entries if isinstance(i, dict)),
+            # 模块实现 + 函数体的语言实现, 都是"一段代码"
+            "implementations": sum(
+                len(i.get("implementations") or []) for i in entries if isinstance(i, dict)
+            ) + function_impl_total,
             "revisions": revision_total,
             "tags": len(tag_counter),
             "languages": sorted(language_counter),

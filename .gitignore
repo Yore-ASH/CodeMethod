@@ -20,10 +20,12 @@ dist/
 build_assets/*.ico
 build_assets/version_info.txt
 
-# 开发期临时文件
+# 开发期临时文件 (下划线开头的脚本/文本)
 _shots/
 _scratch_*.py
 _*.py
+# 例外: __init__.py 也以 "_" 开头, 但它必须入库 (否则包里根本没有 __init__)
+!__init__.py
 _*.txt
 *.cmdb.tmp-*
 *.cmj.tmp-*

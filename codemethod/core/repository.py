@@ -19,7 +19,7 @@ from .history import (
     take_snapshot,
 )
 from .languages import DEFAULT_LANGUAGE, get_language, normalize_language
-from .functions import Function, Symbol
+from .functions import Function, FunctionImplementation, Symbol
 from .models import (
     ACTION_LABELS,
     STATUS_ORDER,
@@ -96,22 +96,33 @@ TAG_PALETTE: Sequence[str] = (    "#569CD6",
 )
 
 
-def detect_function_symbols(function: Function) -> int:
-    """检测 ``function`` 的代码里的变量声明并并入它的符号表, 返回新增数量。
+def detect_implementation_symbols(implementation: Any) -> int:
+    """检测某个语言实现的代码里的变量声明并并入它的符号表, 返回新增数量。
 
     检测器在 :mod:`codemethod.core.symbols`, 是纯标准库的启发式实现
     (正则 + 注释/字符串屏蔽); 这里只负责把结果交给
-    :meth:`Function.apply_detected`, 由后者保证**不覆盖用户已填写的含义**。
+    :meth:`FunctionImplementation.apply_detected`, 由后者保证
+    **不覆盖用户已填写的含义**。
     """
     try:
         from .symbols import detect_symbols
     except ImportError:  # pragma: no cover - symbols 模块缺失时退化为不检测
         return 0
     try:
-        detected = detect_symbols(function.language, function.code, function.name)
+        detected = detect_symbols(
+            implementation.language, implementation.code, getattr(implementation, "name", "")
+        )
     except Exception:  # pragma: no cover - 检测器保证不抛, 这里再兜一层
         return 0
-    return function.apply_detected(detected)
+    return implementation.apply_detected(detected)
+
+
+def detect_function_symbols(function: Function) -> int:
+    """检测函数体**全部语言实现**的变量声明, 返回新增总数。
+
+    兼容旧签名 (以前 Function 只有一种语言)。
+    """
+    return sum(detect_implementation_symbols(impl) for impl in function.active_implementations)
 
 
 class Repository:
@@ -1027,7 +1038,10 @@ class Repository:
         signature: str = "",
         description: str = "",
         prerequisites: str = "",
+        implementation_prerequisites: str = "",
         symbols: Optional[List[Symbol]] = None,
+        notes: str = "",
+        implementations: Optional[List[FunctionImplementation]] = None,
         tags: Iterable[str] = (),
         status: str = "planned",
         favorite: bool = False,
@@ -1036,29 +1050,46 @@ class Repository:
         author: Optional[str] = None,
         summary: str = "",
     ) -> Function:
+        """新建函数体。
+
+        ``prerequisites`` 是所有语言共用的前置要求;
+        ``implementation_prerequisites`` 是**这一种语言**自己的 (旧接口沿用)。
+        也可以直接传 ``implementations`` 一次性给出多语言实现。
+        """
         function = Function(
             id=function_id or new_id("fn_"),
             name=name.strip() or "未命名函数",
-            language=normalize_language(language),
-            signature=signature,
-            code=code,
             description=description,
             prerequisites=prerequisites,
-            symbols=list(symbols or []),
+            implementations=list(implementations or []),
             tags=normalize_tags(tags),
             status=status if status in STATUS_ORDER else "planned",
             favorite=favorite,
         )
+        if not function.implementations:
+            function.implementations.append(
+                FunctionImplementation(
+                    language=normalize_language(language),
+                    signature=signature,
+                    code=code,
+                    notes=notes,
+                    prerequisites=implementation_prerequisites,
+                    symbols=list(symbols or []),
+                )
+            )
         if function.id in self.functions:
             raise RepositoryError(f"函数体 id 冲突: {function.id}")
-        if detect and not function.symbols:
-            detect_function_symbols(function)
+
+        if detect:
+            for impl in function.active_implementations:
+                if not impl.symbols:
+                    detect_implementation_symbols(impl)
+
         self.functions[function.id] = function
         self._register_tags(function.tags)
         detail = summary or (
-            f"新建函数体; 检测到 {len(function.symbols)} 个变量"
-            if function.symbols
-            else "新建函数体"
+            f"新建函数体; {len(function.active_implementations)} 种语言, "
+            f"{function.meanings_summary}"
         )
         self.history.record(function, "create", detail, author or self.author, force=True)
         self._touch()
@@ -1069,15 +1100,18 @@ class Repository:
         function_id: str,
         *,
         name: Optional[str] = None,
-        language: Optional[str] = None,
-        code: Optional[str] = None,
-        signature: Optional[str] = None,
         description: Optional[str] = None,
         prerequisites: Optional[str] = None,
-        symbols: Optional[List[Symbol]] = None,
+        implementations: Optional[List[FunctionImplementation]] = None,
         tags: Optional[Iterable[str]] = None,
         status: Optional[str] = None,
         favorite: Optional[bool] = None,
+        # ---- 旧接口: 直接改主实现的字段, 仍然支持 ----
+        language: Optional[str] = None,
+        code: Optional[str] = None,
+        signature: Optional[str] = None,
+        symbols: Optional[List[Symbol]] = None,
+        notes: Optional[str] = None,
         author: Optional[str] = None,
         summary: str = "",
     ) -> Function:
@@ -1087,18 +1121,30 @@ class Repository:
 
         if name is not None and name.strip():
             function.name = name.strip()
-        if language is not None:
-            function.language = normalize_language(language)
-        if code is not None:
-            function.code = code
-        if signature is not None:
-            function.signature = signature
         if description is not None:
             function.description = description
         if prerequisites is not None:
             function.prerequisites = prerequisites
-        if symbols is not None:
-            function.set_symbols(symbols)
+        if implementations is not None:
+            function.implementations = list(implementations)
+
+        primary = function.active_implementations[0] if function.active_implementations else None
+        if (language is not None or code is not None or signature is not None
+                or symbols is not None or notes is not None):
+            if primary is None:
+                primary = FunctionImplementation()
+                function.implementations.append(primary)
+            if language is not None:
+                primary.language = normalize_language(language)
+            if code is not None:
+                primary.code = code
+            if signature is not None:
+                primary.signature = signature
+            if notes is not None:
+                primary.notes = notes
+            if symbols is not None:
+                primary.set_symbols(symbols)
+
         if tags is not None:
             function.tags = normalize_tags(tags)
             self._register_tags(function.tags)
@@ -1123,6 +1169,136 @@ class Repository:
         self._touch()
         return function
 
+    # ---- 多语言实现 ----
+    def add_function_implementation(
+        self,
+        function_id: str,
+        language: str,
+        code: str = "",
+        *,
+        signature: str = "",
+        notes: str = "",
+        prerequisites: str = "",
+        symbols: Optional[List[Symbol]] = None,
+        implementation_id: Optional[str] = None,
+        detect: bool = True,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> FunctionImplementation:
+        function = self.require_function(function_id)
+        before = take_snapshot(function)
+        impl = FunctionImplementation(
+            id=implementation_id or new_id("fimpl_"),
+            language=normalize_language(language),
+            signature=signature,
+            code=code,
+            notes=notes,
+            prerequisites=prerequisites,
+            symbols=list(symbols or []),
+        )
+        if any(existing.id == impl.id for existing in function.implementations):
+            raise RepositoryError(f"实现 id 冲突: {impl.id}")
+        if detect and not impl.symbols:
+            detect_implementation_symbols(impl)
+        function.implementations.append(impl)
+        function.touch()
+        after = take_snapshot(function)
+        self.history.record(
+            function,
+            "impl_add",
+            summary or f"新增 {impl.language_name} 实现; " + summarize_changes(before, after),
+            author or self.author,
+            force=True,
+        )
+        self._touch()
+        return impl
+
+    def update_function_implementation(
+        self,
+        function_id: str,
+        implementation_id: str,
+        *,
+        language: Optional[str] = None,
+        code: Optional[str] = None,
+        signature: Optional[str] = None,
+        notes: Optional[str] = None,
+        prerequisites: Optional[str] = None,
+        symbols: Optional[List[Symbol]] = None,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> FunctionImplementation:
+        function = self.require_function(function_id)
+        impl = function.get_implementation(implementation_id)
+        if impl is None:
+            raise RepositoryError(f"实现不存在: {implementation_id}")
+        before = take_snapshot(function)
+
+        if language is not None:
+            impl.language = normalize_language(language)
+        if code is not None:
+            impl.code = code
+        if signature is not None:
+            impl.signature = signature
+        if notes is not None:
+            impl.notes = notes
+        if prerequisites is not None:
+            impl.prerequisites = prerequisites
+        if symbols is not None:
+            impl.set_symbols(symbols)
+
+        impl.touch()
+        function.touch()
+        after = take_snapshot(function)
+        if checksum_of(before) == checksum_of(after):
+            return impl
+        self.history.record(
+            function,
+            "impl_update",
+            summary or summarize_changes(before, after),
+            author or self.author,
+        )
+        self._touch()
+        return impl
+
+    def delete_function_implementation(
+        self, function_id: str, implementation_id: str, *, author: Optional[str] = None
+    ) -> None:
+        function = self.require_function(function_id)
+        impl = function.get_implementation(implementation_id)
+        if impl is None:
+            raise RepositoryError(f"实现不存在: {implementation_id}")
+        if impl.deleted:
+            return
+        before = take_snapshot(function)
+        impl.deleted = True
+        impl.touch()
+        function.touch()
+        after = take_snapshot(function)
+        self.history.record(
+            function,
+            "impl_delete",
+            f"删除 {impl.language_name} 实现; " + summarize_changes(before, after),
+            author or self.author,
+            force=True,
+        )
+        self._touch()
+
+    def restore_function_implementation(
+        self, function_id: str, implementation_id: str, *, author: Optional[str] = None
+    ) -> None:
+        function = self.require_function(function_id)
+        impl = function.get_implementation(implementation_id)
+        if impl is None or not impl.deleted:
+            return
+        impl.deleted = False
+        impl.touch()
+        function.touch()
+        self.history.record(
+            function, "impl_restore", f"恢复 {impl.language_name} 实现",
+            author or self.author, force=True,
+        )
+        self._touch()
+
     def require_function(self, function_id: str) -> Function:
         function = self.functions.get(function_id)
         if function is None:
@@ -1132,25 +1308,37 @@ class Repository:
     def detect_function_symbols(
         self,
         function_id: str,
+        implementation_id: str = "",
         *,
         author: Optional[str] = None,
         record: bool = True,
     ) -> Tuple[int, Function]:
         """重新检测变量并并入符号表, 返回 ``(新增数量, 函数体)``。
 
-        **用户已经填写的含义永远不会被覆盖** —— 见 :meth:`Function.apply_detected`。
+        只传 ``function_id`` 时检测**全部语言实现**; 指定 ``implementation_id`` 则只检测那一个。
+        **用户已经填写的含义永远不会被覆盖** —— 见 :meth:`FunctionImplementation.apply_detected`。
         """
         function = self.require_function(function_id)
+        targets = (
+            [function.get_implementation(implementation_id)]
+            if implementation_id
+            else function.active_implementations
+        )
+        targets = [impl for impl in targets if impl is not None]
+        if not targets:
+            return 0, function
+
         before = take_snapshot(function)
-        added = detect_function_symbols(function)
+        added = sum(detect_implementation_symbols(impl) for impl in targets)
         after = take_snapshot(function)
         if record and checksum_of(before) != checksum_of(after):
             function.touch()
             after = take_snapshot(function)
+            scope = targets[0].language_name if len(targets) == 1 else f"{len(targets)} 种语言"
             self.history.record(
                 function,
                 "symbols_detect",
-                f"自动检测变量: 新增 {added} 个; " + summarize_changes(before, after),
+                f"自动检测变量 ({scope}): 新增 {added} 个; " + summarize_changes(before, after),
                 author or self.author,
                 force=True,
             )
@@ -1162,13 +1350,23 @@ class Repository:
         function_id: str,
         symbols: List[Symbol],
         *,
+        implementation_id: str = "",
         author: Optional[str] = None,
         summary: str = "",
     ) -> Function:
-        """整体替换变量含义表 (保存函数体时使用)。"""
-        return self.update_function(
-            function_id, symbols=symbols, author=author, summary=summary
+        """整体替换某个语言实现的变量含义表 (不传实现 id 则改主实现)。"""
+        function = self.require_function(function_id)
+        target = (
+            function.get_implementation(implementation_id)
+            if implementation_id
+            else (function.active_implementations[0] if function.active_implementations else None)
         )
+        if target is None:
+            return function
+        self.update_function_implementation(
+            function_id, target.id, symbols=symbols, author=author, summary=summary
+        )
+        return function
 
     def delete_function(
         self, function_id: str, *, hard: bool = False, author: Optional[str] = None
@@ -1201,6 +1399,119 @@ class Repository:
         )
         self._touch()
         return function
+
+    # ==================================================================================
+    # 通用操作 (按 id 自动分派到模块 / 空间 / 函数体)
+    # ==================================================================================
+    #
+    # 界面只跟这组方法打交道。以前界面直接调 delete_entry/update_entry, 于是对空间与
+    # 函数体沉默失效 —— 这类"忘了分派"的 bug 现在由这一层兜住。
+    def set_item_status(self, item_id: str, status: str, *, author: Optional[str] = None) -> Any:
+        if status not in STATUS_ORDER:
+            raise RepositoryError(f"未知状态: {status}")
+        kind = self.kind_of(item_id)
+        if kind == "space":
+            return self.update_space(item_id, status=status, author=author)
+        if kind == "function":
+            return self.update_function(item_id, status=status, author=author)
+        return self.update_entry(item_id, status=status, author=author)
+
+    def set_item_tags(
+        self, item_id: str, tags: Iterable[str], *, author: Optional[str] = None
+    ) -> Any:
+        kind = self.kind_of(item_id)
+        if kind == "space":
+            return self.update_space(item_id, tags=tags, author=author)
+        if kind == "function":
+            return self.update_function(item_id, tags=tags, author=author)
+        return self.update_entry(item_id, tags=tags, author=author)
+
+    def toggle_favorite_item(self, item_id: str, *, author: Optional[str] = None) -> Any:
+        """切换收藏并写入历史。空间与函数体也走这里。"""
+        entity = self.require_any(item_id)
+        before = take_snapshot(entity)
+        entity.favorite = not entity.favorite
+        entity.touch()
+        after = take_snapshot(entity)
+        self.history.record(
+            entity,
+            "favorite",
+            ("收藏" if entity.favorite else "取消收藏") + f" ({summarize_changes(before, after)})",
+            author or self.author,
+            force=True,
+        )
+        self._invalidate(entity)
+        self._touch()
+        return entity
+
+    def duplicate_item(self, item_id: str, *, author: Optional[str] = None) -> Any:
+        kind = self.kind_of(item_id)
+        if kind == "space":
+            return self.duplicate_space(item_id, author=author)
+        if kind == "function":
+            return self.duplicate_function(item_id, author=author)
+        return self.duplicate_entry(item_id, author=author)
+
+    def duplicate_space(self, space_id: str, *, author: Optional[str] = None) -> Space:
+        source = self.require_space(space_id)
+        clone = Space.from_dict(source.to_dict())
+        clone.id = new_id("spc_")
+        clone.name = f"{source.display_title} (副本)"
+        clone.created_at = utcnow()
+        clone.updated_at = clone.created_at
+        clone.version = 1
+        clone.deleted = False
+        self.spaces[clone.id] = clone
+        self._register_tags(clone.tags)
+        self.history.record(
+            clone, "create", f"复制自空间《{source.display_title}》", author or self.author,
+            force=True,
+        )
+        self._touch()
+        return clone
+
+    def duplicate_function(self, function_id: str, *, author: Optional[str] = None) -> Function:
+        source = self.require_function(function_id)
+        clone = Function.from_dict(source.to_dict())
+        clone.id = new_id("fn_")
+        clone.name = f"{source.display_title} (副本)"
+        clone.created_at = utcnow()
+        clone.updated_at = clone.created_at
+        clone.version = 1
+        clone.deleted = False
+        clone.implementations = [
+            impl.clone(new_identity=True) for impl in source.implementations
+        ]
+        self.functions[clone.id] = clone
+        self._register_tags(clone.tags)
+        self.history.record(
+            clone, "create", f"复制自函数体《{source.display_title}》", author or self.author,
+            force=True,
+        )
+        self._touch()
+        return clone
+
+    def delete_item(self, item_id: str, *, hard: bool = False, author: Optional[str] = None) -> None:
+        """删除任意一类实体 (软删除进回收站, ``hard=True`` 时彻底移除)。"""
+        kind = self.kind_of(item_id)
+        if kind == "space":
+            self.delete_space(item_id, hard=hard, author=author)
+        elif kind == "function":
+            self.delete_function(item_id, hard=hard, author=author)
+        else:
+            self.delete_entry(item_id, hard=hard, author=author)
+
+    def restore_item(self, item_id: str, *, author: Optional[str] = None) -> Any:
+        kind = self.kind_of(item_id)
+        if kind == "space":
+            return self.restore_space(item_id, author=author)
+        if kind == "function":
+            return self.restore_function(item_id, author=author)
+        return self.restore_entry(item_id, author=author)
+
+    def item_is_deleted(self, item_id: str) -> bool:
+        entity = self.get_item(item_id)
+        return bool(entity is None or entity.deleted)
 
     # ==================================================================================
     # 历史 / 回滚
@@ -1364,17 +1675,21 @@ class Repository:
         impls = [impl for e in entries for impl in e.active_implementations]
         spaces = [s for s in self.spaces.values() if not s.deleted]
         functions = [f for f in self.functions.values() if not f.deleted]
+        function_impls = [impl for f in functions for impl in f.active_implementations]
+        all_impls = impls + function_impls
         counts = self._entity_counts()
         return {
             "name": self.name,
             "entries": len(entries),
             "deleted_entries": len(deleted),
-            "implementations": len(impls),
-            "languages": len({impl.language for impl in impls}),
+            "implementations": len(all_impls),
+            "module_implementations": len(impls),
+            "function_implementations": len(function_impls),
+            "languages": len({impl.language for impl in all_impls}),
             "tags": len(self.all_tags(include_unused=False)),
             "revisions": self.history.total_count(),
-            "code_lines": sum(impl.line_count for impl in impls),
-            "code_chars": sum(len(impl.code) for impl in impls),
+            "code_lines": sum(impl.line_count for impl in all_impls),
+            "code_chars": sum(len(impl.code) for impl in all_impls),
             # 三类实体
             "modules": counts.get("module", 0),
             "spaces": counts.get("space", 0),
@@ -1382,7 +1697,7 @@ class Repository:
             "space_files": sum(len(s.files) for s in spaces),
             "space_bytes": sum(s.total_size for s in spaces),
             "space_readmes": sum(len(s.readme_files) for s in spaces),
-            "function_symbols": sum(len(f.symbols) for f in functions),
+            "function_symbols": sum(f.total_symbols for f in functions),
             "symbols_missing_meaning": sum(
                 len(f.symbols_missing_meaning) for f in functions
             ),
@@ -1489,4 +1804,5 @@ __all__ = [
     "build_revision_diff",
     "summarize_changes",
     "detect_function_symbols",
+    "detect_implementation_symbols",
 ]

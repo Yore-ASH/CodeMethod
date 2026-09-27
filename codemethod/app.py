@@ -395,7 +395,7 @@ class TestTokenizer(unittest.TestCase):
     for path, content in space_files:
         repo.put_space_file(space.id, path, content)
 
-    # ---- 函数体: 自动检测变量并要求填写含义 ----
+    # ---- 函数体: 自动检测变量并要求填写含义 (同一个函数可以有多语言实现) ----
     function = repo.create_function(
         "mod_pow",
         "python",
@@ -410,8 +410,9 @@ class TestTokenizer(unittest.TestCase):
         base = base * base % modulus
     return result
 ''',
-        description="经典的二进制快速幂, O(log exp)。",
-        prerequisites="Python 3.6+；仅用整数运算, 无依赖。",
+        description="经典的二进制快速幂, O(log exp)。同一个函数用 Python / Go / Rust 三种语言分别实现。",
+        prerequisites="仅用整数运算, 无第三方依赖。",
+        implementation_prerequisites="Python 3.6+",
         tags=["algorithm", "math", "demo"],
         status="done",
     )
@@ -423,10 +424,90 @@ class TestTokenizer(unittest.TestCase):
         "result": "累计的结果",
         "return": "base 的 exp 次方对 modulus 取模的结果",
     }
-    for symbol in function.symbols:
+    python_impl = function.active_implementations[0]
+    for symbol in python_impl.symbols:
         if symbol.name in meanings:
             symbol.meaning = meanings[symbol.name]
-    repo.set_function_symbols(function.id, function.symbols, summary="填写变量含义")
+    repo.set_function_symbols(
+        function.id, python_impl.symbols, implementation_id=python_impl.id,
+        summary="填写变量含义 (Python)",
+    )
+
+    # 同一个函数的 Go 实现 —— 前置要求与变量表都是这一种语言自己的
+    go_impl = repo.add_function_implementation(
+        function.id,
+        "go",
+        '''package modpow
+
+// modPow 计算 (base ** exp) % modulus, 全程不溢出。
+func modPow(base, exp, modulus int64) int64 {
+	result := int64(1)
+	base %= modulus
+	for exp > 0 {
+		if exp&1 == 1 {
+			result = result * base % modulus
+		}
+		exp >>= 1
+		base = base * base % modulus
+	}
+	return result
+}
+''',
+        signature="func modPow(base, exp, modulus int64) int64",
+        prerequisites="Go 1.21+；只用标准库, 需要 64 位整数。",
+        notes="Go 版直接用 int64 算术, 溢出行为与 Python 的大整数不同, 所以必须由调用方保证 base/modulus 在 int64 范围内。",
+    )
+    go_meanings = {
+        "base": "底数",
+        "exp": "指数",
+        "modulus": "取模的模数",
+        "result": "累计的结果",
+        "return": "base 的 exp 次方对 modulus 取模的结果",
+    }
+    for symbol in go_impl.symbols:
+        if symbol.name in go_meanings:
+            symbol.meaning = go_meanings[symbol.name]
+    repo.set_function_symbols(
+        function.id, go_impl.symbols, implementation_id=go_impl.id,
+        summary="填写变量含义 (Go)",
+    )
+
+    # 再来一个 Rust 实现
+    rust_impl = repo.add_function_implementation(
+        function.id,
+        "rust",
+        '''/// 快速幂取模: 计算 (base ** exp) % modulus。
+pub fn mod_pow(mut base: u128, mut exp: u128, modulus: u128) -> u128 {
+    let mut result: u128 = 1;
+    base %= modulus;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * base % modulus;
+        }
+        exp >>= 1;
+        base = base * base % modulus;
+    }
+    result
+}
+''',
+        signature="pub fn mod_pow(base: u128, exp: u128, modulus: u128) -> u128",
+        prerequisites="Rust 1.70+；使用 u128 以便容纳中间乘积, 需要 rustc 2021 edition。",
+        notes="Rust 版显式使用 u128 避免乘法溢出, 代价是只能处理 128 位以内的模数。",
+    )
+    rust_meanings = {
+        "base": "底数",
+        "exp": "指数",
+        "modulus": "取模的模数",
+        "result": "累计的结果",
+        "return": "base 的 exp 次方对 modulus 取模的结果",
+    }
+    for symbol in rust_impl.symbols:
+        if symbol.name in rust_meanings:
+            symbol.meaning = rust_meanings[symbol.name]
+    repo.set_function_symbols(
+        function.id, rust_impl.symbols, implementation_id=rust_impl.id,
+        summary="填写变量含义 (Rust)",
+    )
 
     return repo
 
@@ -573,15 +654,24 @@ def run_self_test(report_path: Optional[str] = None) -> int:
                 f"{len(sample_space.readme_files)} 个 README, 命中 {len(hits)} 处",
             )
 
-        # 函数体: 变量检测 + 含义表往返
+        # 函数体: 多语言实现 + 变量检测 + 含义表往返
         sample_function = next(iter(repo.functions.values()), None)
         if sample_function is None:
             check("示例库含函数体", False)
         else:
             check(
+                "同一个函数有多种语言实现",
+                len(sample_function.active_implementations) >= 2,
+                "、".join(impl.language_name for impl in sample_function.active_implementations),
+            )
+            check(
                 "自动检测到变量声明",
-                len(sample_function.symbols) > 0,
-                ", ".join(s.name for s in sample_function.symbols[:6]),
+                sample_function.total_symbols > 0,
+                ", ".join(s.name for s in sample_function.all_symbols[:6]),
+            )
+            check(
+                "每种语言有自己的前置要求",
+                all(impl.prerequisites.strip() for impl in sample_function.active_implementations),
             )
             check(
                 "变量含义已填写",
@@ -589,10 +679,16 @@ def run_self_test(report_path: Optional[str] = None) -> int:
             )
             restored_function = reopened.repository.functions.get(sample_function.id)
             check(
-                "变量含义存盘后保留",
+                "多语言实现的含义表存盘后保留",
                 restored_function is not None
-                and [(s.name, s.kind, s.meaning) for s in restored_function.symbols]
-                == [(s.name, s.kind, s.meaning) for s in sample_function.symbols],
+                and [
+                    (impl.language, [(s.name, s.kind, s.meaning) for s in impl.symbols])
+                    for impl in restored_function.active_implementations
+                ]
+                == [
+                    (impl.language, [(s.name, s.kind, s.meaning) for s in impl.symbols])
+                    for impl in sample_function.active_implementations
+                ],
             )
 
         md = os.path.join(tmp, "lib.md")
@@ -708,11 +804,21 @@ def run_self_test(report_path: Optional[str] = None) -> int:
                 window.detail_stack.currentWidget() is window.function_panel,
             )
             function_shown = window.function_panel.current_function()
+            current_impl = function_shown.active_implementations[0] if (
+                function_shown is not None and function_shown.active_implementations
+            ) else None
             check(
                 "变量含义表已填充",
-                function_shown is not None
-                and window.function_panel.symbol_table.rowCount() == len(function_shown.symbols),
+                current_impl is not None
+                and window.function_panel.symbol_table.rowCount() == len(current_impl.symbols),
                 f"{window.function_panel.symbol_table.rowCount()} 行",
+            )
+            check(
+                "语言实现下拉框列出全部语言",
+                function_shown is not None
+                and window.function_panel.language_combo.count()
+                == len(function_shown.active_implementations),
+                f"{window.function_panel.language_combo.count()} 种语言",
             )
 
         # ---- 类别切换 ----

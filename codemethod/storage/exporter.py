@@ -239,11 +239,15 @@ def _bar_char(share) -> str:
 
 
 def function_to_markdown(function: Function, *, revisions: Optional[List[Revision]] = None) -> str:
-    """把一个函数体渲染成 Markdown (代码 + **变量含义表**)。"""
+    """把一个函数体渲染成 Markdown (每种语言的代码 + **变量含义表**)。"""
     lines: List[str] = []
     lines.append(f"# 函数体: {function.display_title}")
     lines.append("")
-    meta = [f"语言: **{function.language_name}**", f"状态: **{function.status_label}**"]
+    implementations = function.active_implementations
+    meta = [
+        f"语言: **{'、'.join(impl.language_name for impl in implementations) or '（无）'}**",
+        f"状态: **{function.status_label}**",
+    ]
     if function.favorite:
         meta.append("★ 收藏")
     meta.append(f"更新: {format_ts(function.updated_at)}")
@@ -253,7 +257,7 @@ def function_to_markdown(function: Function, *, revisions: Optional[List[Revisio
         lines.append("标签: " + " ".join(f"`#{t}`" for t in function.tags))
         lines.append("")
 
-    lines.append("## 前置要求")
+    lines.append("## 通用前置要求")
     lines.append("")
     lines.append(function.prerequisites.strip() or "_（未填写）_")
     lines.append("")
@@ -264,36 +268,48 @@ def function_to_markdown(function: Function, *, revisions: Optional[List[Revisio
         lines.append(function.description.strip())
         lines.append("")
 
-    if function.signature.strip():
-        lines.append("## 函数签名")
+    for index, impl in enumerate(implementations, 1):
+        lines.append(f"## 实现 {index}: {impl.language_name}")
         lines.append("")
-        lines.append(f"```{_fence(function.language)}")
-        lines.append(function.signature.strip())
+        lines.append(f"**这一语言的前置要求**: {impl.prerequisites.strip() or '_（未填写）_'}")
+        lines.append("")
+        if impl.notes.strip():
+            lines.append(impl.notes.strip())
+            lines.append("")
+        if impl.signature.strip():
+            lines.append("**函数签名**")
+            lines.append("")
+            lines.append(f"```{_fence(impl.language)}")
+            lines.append(impl.signature.strip())
+            lines.append("```")
+            lines.append("")
+
+        lines.append("**变量含义**")
+        lines.append("")
+        if impl.symbols:
+            lines.append("| 名称 | 种类 | 类型 | 默认值 | 含义 |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for symbol in impl.symbols:
+                meaning = symbol.meaning.replace("|", chr(92) + "|") or "_（未填写）_"
+                lines.append(
+                    f"| `{symbol.name}` | {symbol.kind_label} | {symbol.type or '—'} "
+                    f"| {symbol.default or '—'} | {meaning} |"
+                )
+            lines.append("")
+        else:
+            lines.append("_（尚未检测到变量）_")
+            lines.append("")
+
+        lines.append("**代码**")
+        lines.append("")
+        lines.append(f"```{_fence(impl.language)}")
+        lines.append(impl.code.rstrip("\n"))
         lines.append("```")
         lines.append("")
 
-    lines.append("## 变量含义")
-    lines.append("")
-    if function.symbols:
-        lines.append("| 名称 | 种类 | 类型 | 默认值 | 含义 |")
-        lines.append("| --- | --- | --- | --- | --- |")
-        for symbol in function.symbols:
-            meaning = symbol.meaning.replace("|", chr(92) + "|") or "_（未填写）_"
-            lines.append(
-                f"| `{symbol.name}` | {symbol.kind_label} | {symbol.type or '—'} "
-                f"| {symbol.default or '—'} | {meaning} |"
-            )
+    if not implementations:
+        lines.append("_（这个函数体还没有任何语言实现）_")
         lines.append("")
-    else:
-        lines.append("_（尚未检测到变量）_")
-        lines.append("")
-
-    lines.append("## 代码")
-    lines.append("")
-    lines.append(f"```{_fence(function.language)}")
-    lines.append(function.code.rstrip("\n"))
-    lines.append("```")
-    lines.append("")
 
     if revisions:
         lines.append("## 修订历史")
@@ -369,6 +385,20 @@ def library_to_markdown(repo: Repository, entries: Optional[Iterable[Entry]] = N
 
 def entry_to_json(entry: Entry, *, revisions: Optional[List[Revision]] = None, indent: int = 2) -> str:
     data = entry.to_dict()
+    if revisions:
+        data["revisions"] = [rev.to_dict() for rev in revisions]
+    return json.dumps(data, ensure_ascii=False, indent=indent)
+
+
+def space_to_json(space: Space, *, revisions: Optional[List[Revision]] = None, indent: int = 2) -> str:
+    data = space.to_dict()
+    if revisions:
+        data["revisions"] = [rev.to_dict() for rev in revisions]
+    return json.dumps(data, ensure_ascii=False, indent=indent)
+
+
+def function_to_json(function: Function, *, revisions: Optional[List[Revision]] = None, indent: int = 2) -> str:
+    data = function.to_dict()
     if revisions:
         data["revisions"] = [rev.to_dict() for rev in revisions]
     return json.dumps(data, ensure_ascii=False, indent=indent)
@@ -500,7 +530,7 @@ def export_zip(repo: Repository, path: str, entries: Optional[Iterable[Entry]] =
                 )
                 archive.writestr(f"{folder}/{file.path}", body)
 
-        # ---- 函数体 ----
+        # ---- 函数体: 每种语言一个源码文件 + 含义表 ----
         for function in functions:
             base = unique_folder(_safe_name(function.display_title))
             archive.writestr(
@@ -509,8 +539,18 @@ def export_zip(repo: Repository, path: str, entries: Optional[Iterable[Entry]] =
             )
             archive.writestr(
                 f"functions/{base}.json",
-                entry_to_json(function, revisions=repo.revisions(function.id)),
+                function_to_json(function, revisions=repo.revisions(function.id)),
             )
+            file_names = {}
+            for impl in function.active_implementations:
+                language = get_language(impl.language)
+                extension = language.extensions[0] if language.extensions else "txt"
+                filename = f"{base}.{extension}"
+                seen = file_names.get(filename, 0)
+                file_names[filename] = seen + 1
+                if seen:
+                    filename = f"{base}_{seen + 1}.{extension}"
+                archive.writestr(f"functions/{base}/{filename}", impl.code)
 
     return len(selected) + len(spaces) + len(functions)
 
