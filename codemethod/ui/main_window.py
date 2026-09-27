@@ -20,10 +20,13 @@ from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -33,6 +36,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTextBrowser,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -42,20 +46,26 @@ from ..core.languages import get_language
 from ..core.models import STATUS_LABELS, STATUS_ORDER, Entry, format_ts
 from ..core.query import QuerySpec, TagMatch, query_entries, related_tags
 from ..core.repository import Repository, RepositoryError
+from ..core.spaces import normalize_project_path
 from ..storage import exporter
 from ..storage.container import BINARY_EXTENSIONS, TEXT_EXTENSIONS, human_size
 from ..storage.database import Database, DatabaseError
 from .dialogs.about_dialog import AboutDialog
 from .dialogs.container_dialog import ContainerInfoDialog, VerifyResultDialog
 from .dialogs.entry_editor import EntryEditorDialog
+from .dialogs.function_editor import FunctionEditorDialog
 from .dialogs.implementation_dialog import ImplementationDialog
+from .dialogs.readme_search import ReadmeSearchDialog
+from .dialogs.space_editor import SpaceEditorDialog
 from .dialogs.tag_manager import TagManagerDialog
 from .resources import app_icon
 from .theme import THEMES, Theme, apply_theme, get_theme, theme_names
 from .widgets.detail_panel import DetailPanel
 from .widgets.entry_list import EntryListView
+from .widgets.function_detail import FunctionDetailPanel
 from .widgets.history_panel import HistoryPanel
 from .widgets.search_bar import SearchBar
+from .widgets.space_detail import SpaceDetailPanel
 from .widgets.tag_panel import TagPanel
 
 FILE_FILTER = (
@@ -200,6 +210,10 @@ class MainWindow(QMainWindow):
         self.theme: Theme = get_theme(theme_key)
         self.query = QuerySpec()
         self._current_entry_id: str = ""
+        # 当前选中对象属于哪一类 (module / space / function); 详情面板据此切换
+        self._current_kind: str = "module"
+        # 类别切换条当前的选择 ("all" / "module" / "space" / "function")
+        self._active_kind: str = "all"
         self._suspend_refresh = False
         # refresh_list 重建列表期间置位: 抑制 currentChanged 引发的重复详情刷新
         self._suppress_selection_signal = False
@@ -271,13 +285,14 @@ class MainWindow(QMainWindow):
         self.act_verify = self._act("校验文件完整性…", self.verify_file, tip="检查魔数、CRC32、SHA-256")
         self.act_quit = self._act("退出", self.close, shortcut="Ctrl+Q")
 
-        self.act_new_entry = self._act("新建条目", self.new_entry, shortcut="Ctrl+N", tip="新建一个功能条目")
-        self.act_edit_entry = self._act("编辑条目", self.edit_entry, shortcut="Ctrl+E", tip="编辑当前条目与全部实现")
+        # ---- 模块 (原"条目", 换个更贴切的名字) ----
+        self.act_new_entry = self._act("新建模块", self.new_entry, shortcut="Ctrl+N", tip="新建一个功能模块 (一个问题 + 多语言实现)")
+        self.act_edit_entry = self._act("编辑模块", self.edit_entry, shortcut="Ctrl+E", tip="编辑当前模块与全部语言实现")
         self.act_add_impl = self._act(
             "添加语言实现…",
             lambda: self.add_implementation(),
             shortcut="Ctrl+L",
-            tip="为当前条目再添加一种语言的实现 — 同一个问题, 不同语言的解法",
+            tip="为当前模块再添加一种语言的实现 — 同一个问题, 不同语言的解法",
         )
         self.act_edit_impl = self._act(
             "编辑当前语言实现…",
@@ -285,24 +300,49 @@ class MainWindow(QMainWindow):
             shortcut="Ctrl+Shift+E",
             tip="编辑当前页签对应语言的实现",
         )
+
+        # ---- 独立空间 / 函数体 ----
+        self.act_new_space = self._act(
+            "新建空间", self.new_space, shortcut="Ctrl+Shift+W",
+            tip="在代码库内新建一个完整项目 (所有文件都存进同一个 .cmdb)",
+        )
+        self.act_edit_space = self._act("编辑空间", lambda: self.edit_space(), shortcut="Ctrl+Shift+O")
+        self.act_new_function = self._act(
+            "新建函数体", self.new_function, shortcut="Ctrl+Shift+F",
+            tip="写一个特定语言的函数, 自动检测变量并要求填写含义",
+        )
+        self.act_edit_function = self._act("编辑函数体", lambda: self.edit_function(), shortcut="Ctrl+Shift+G")
+        self.act_redetect_symbols = self._act(
+            "重新检测变量", lambda: self.redetect_symbols(), shortcut="Ctrl+Shift+R",
+            tip="按当前代码重新扫描变量声明 (已填写的含义不会被覆盖)",
+        )
+        self.act_readme_search = self._act(
+            "README 检索…", self.search_readmes, shortcut="Ctrl+Shift+D",
+            tip="在全部空间的 README 文件里搜索",
+        )
+        self.act_kind_all = self._act("全部", lambda: self.set_kind_filter("all"), shortcut="Alt+0")
+        self.act_kind_module = self._act("只看模块", lambda: self.set_kind_filter("module"), shortcut="Alt+1")
+        self.act_kind_space = self._act("只看空间", lambda: self.set_kind_filter("space"), shortcut="Alt+2")
+        self.act_kind_function = self._act("只看函数体", lambda: self.set_kind_filter("function"), shortcut="Alt+3")
+
         self.act_duplicate_entry = self._act("创建副本", self.duplicate_entry)
-        self.act_delete_entry = self._act("删除条目", self.delete_entry, shortcut="Ctrl+Delete", tip="移入回收站 (可在历史中恢复)")
+        self.act_delete_entry = self._act("删除", self.delete_entry, shortcut="Ctrl+Delete", tip="移入回收站 (可在历史中恢复)")
         self.act_restore_entry = self._act("从回收站恢复", self.restore_entry)
-        self.act_purge_entry = self._act("彻底删除…", self.purge_entry, tip="不可撤销地移除条目")
+        self.act_purge_entry = self._act("彻底删除…", self.purge_entry, tip="不可撤销地移除对象")
         self.act_toggle_favorite = self._act("收藏 / 取消收藏", self.toggle_favorite, shortcut="Ctrl+D")
         self.act_set_status = self._act("设置规划状态…", self.set_planning_status)
 
-        self.act_undo = self._act("撤销", self.undo, shortcut="Ctrl+Z", tip="回退当前条目的上一条修订")
-        self.act_redo = self._act("重做", self.redo, shortcut="Ctrl+Y", tip="前进当前条目的下一条修订")
+        self.act_undo = self._act("撤销", self.undo, shortcut="Ctrl+Z", tip="回退当前对象的上一条修订")
+        self.act_redo = self._act("重做", self.redo, shortcut="Ctrl+Y", tip="前进当前对象的下一条修订")
         self.act_show_history = self._act("显示历史面板", self._toggle_history, shortcut="Ctrl+H", checkable=True, tip="显示/隐藏历史面板")
         self.act_show_history.setChecked(True)
 
         self.act_copy_code = self._act("复制当前实现代码", self.copy_current_code, shortcut="Ctrl+Shift+C", tip="复制到剪贴板")
-        self.act_copy_entry_md = self._act("复制条目为 Markdown", lambda: self.copy_entry_as("markdown"), shortcut="Ctrl+Shift+M")
-        self.act_copy_entry_json = self._act("复制条目为 JSON", lambda: self.copy_entry_as("json"))
+        self.act_copy_entry_md = self._act("复制为 Markdown", lambda: self.copy_entry_as("markdown"), shortcut="Ctrl+Shift+M")
+        self.act_copy_entry_json = self._act("复制为 JSON", lambda: self.copy_entry_as("json"))
 
         self.act_manage_tags = self._act("标签管理…", self.manage_tags, shortcut="Ctrl+T")
-        self.act_new_tag_on_entry = self._act("给当前条目添加标签…", self.add_tag_to_current, shortcut="Ctrl+Shift+T")
+        self.act_new_tag_on_entry = self._act("给当前对象添加标签…", self.add_tag_to_current, shortcut="Ctrl+Shift+T")
         self.act_focus_search = self._act("检索…", self.focus_search, shortcut="Ctrl+F")
         self.act_clear_search = self._act("清空检索条件", self.clear_search, shortcut="Escape")
         self.act_refresh = self._act("刷新", self.refresh_all, shortcut="F5")
@@ -336,11 +376,12 @@ class MainWindow(QMainWindow):
         self.sidebar_stack.setMinimumWidth(190)
         central.addWidget(self.sidebar_stack)
 
-        # ---- 中间: 检索 + 列表 ----
+        # ---- 中间: 类别切换 + 检索 + 列表 ----
         left = QWidget(central)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
+        left_layout.addWidget(self._build_kind_bar(left))
         self.search_bar = SearchBar(left, theme=self.theme)
         left_layout.addWidget(self.search_bar)
         self.entry_list = EntryListView(left, theme=self.theme)
@@ -348,10 +389,16 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.entry_list, 1)
         central.addWidget(left)
 
-        # ---- 右侧: 详情 ----
-        self.detail_panel = DetailPanel(central, theme=self.theme)
-        self.detail_panel.setMinimumWidth(340)
-        central.addWidget(self.detail_panel)
+        # ---- 右侧: 详情 (模块 / 空间 / 函数体 三种面板) ----
+        self.detail_stack = QStackedWidget(central)
+        self.detail_panel = DetailPanel(self.detail_stack, theme=self.theme)
+        self.space_panel = SpaceDetailPanel(self.detail_stack, theme=self.theme)
+        self.function_panel = FunctionDetailPanel(self.detail_stack, theme=self.theme)
+        self.detail_stack.addWidget(self.detail_panel)
+        self.detail_stack.addWidget(self.space_panel)
+        self.detail_stack.addWidget(self.function_panel)
+        self.detail_stack.setMinimumWidth(340)
+        central.addWidget(self.detail_stack)
 
         central.setStretchFactor(0, 0)
         central.setStretchFactor(1, 4)
@@ -370,6 +417,54 @@ class MainWindow(QMainWindow):
         self.main_splitter.setStretchFactor(1, 2)
         self.main_splitter.setSizes([620, 240])
         self.setCentralWidget(self.main_splitter)
+
+    def _build_kind_bar(self, parent: QWidget) -> QWidget:
+        """类别切换条: 全部 / 模块 / 空间 / 函数体。
+
+        三类实体共用一个列表, 这里决定筛选哪一类。
+        """
+        bar = QWidget(parent)
+        bar.setObjectName("CodeHeader")
+        bar.setFixedHeight(32)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(8, 0, 8, 0)
+        row.setSpacing(4)
+
+        label = QLabel("类别", bar)
+        label.setObjectName("MutedLabel")
+        row.addWidget(label)
+
+        self._kind_buttons: Dict[str, QToolButton] = {}
+        for key, text, tip in (
+            ("all", "全部", "显示模块、空间与函数体"),
+            ("module", "模块", "一个问题 + 多种语言实现"),
+            ("space", "空间", "库内的完整项目结构 (多文件)"),
+            ("function", "函数体", "单个语言的函数 + 变量含义表"),
+        ):
+            button = QToolButton(bar)
+            button.setText(text)
+            button.setToolTip(tip)
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            button.setChecked(key == "all")
+            button.clicked.connect(lambda _c=False, k=key: self.set_kind_filter(k))
+            row.addWidget(button)
+            self._kind_buttons[key] = button
+
+        row.addStretch(1)
+        self.kind_count_label = QLabel("", bar)
+        self.kind_count_label.setObjectName("DimLabel")
+        row.addWidget(self.kind_count_label)
+        return bar
+
+    def set_kind_filter(self, kind: str) -> None:
+        """切换列表里显示哪一类实体。"""
+        self.query.kinds = [] if kind == "all" else [kind]
+        self._active_kind = kind
+        for key, button in getattr(self, "_kind_buttons", {}).items():
+            button.setChecked(key == kind)
+        # 切换类别后原来的选中项多半不在列表里了, 让 refresh_list 自己挑一个
+        self.refresh_list(select_id="")
 
     def _build_menus(self) -> None:
         bar = self.menuBar()
@@ -401,11 +496,17 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_quit)
 
         edit_menu = bar.addMenu("编辑(&E)")
-        edit_menu.addAction(self.act_new_entry)
+        new_menu = edit_menu.addMenu("新建")
+        new_menu.addAction(self.act_new_entry)
+        new_menu.addAction(self.act_new_space)
+        new_menu.addAction(self.act_new_function)
         edit_menu.addAction(self.act_edit_entry)
+        edit_menu.addAction(self.act_edit_space)
+        edit_menu.addAction(self.act_edit_function)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_add_impl)
         edit_menu.addAction(self.act_edit_impl)
+        edit_menu.addAction(self.act_redetect_symbols)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_duplicate_entry)
         edit_menu.addAction(self.act_delete_entry)
@@ -421,6 +522,11 @@ class MainWindow(QMainWindow):
 
         view_menu = bar.addMenu("视图(&V)")
         view_menu.addAction(self.act_refresh)
+        kind_menu = view_menu.addMenu("显示类别")
+        kind_menu.addAction(self.act_kind_all)
+        kind_menu.addAction(self.act_kind_module)
+        kind_menu.addAction(self.act_kind_space)
+        kind_menu.addAction(self.act_kind_function)
         view_menu.addSeparator()
         sidebar_menu = view_menu.addMenu("侧边栏")
         self.act_sidebar_tags = self._act("标签筛选", lambda: self._show_sidebar(0), shortcut="Ctrl+1")
@@ -433,6 +539,8 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.act_autosave)
 
         tools_menu = bar.addMenu("工具(&T)")
+        tools_menu.addAction(self.act_readme_search)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.act_manage_tags)
         tools_menu.addAction(self.act_new_tag_on_entry)
         tools_menu.addSeparator()
@@ -454,6 +562,9 @@ class MainWindow(QMainWindow):
         self.toolbar = bar
 
         bar.addAction(self.act_new_entry)
+        bar.addAction(self.act_new_space)
+        bar.addAction(self.act_new_function)
+        bar.addSeparator()
         bar.addAction(self.act_edit_entry)
         bar.addAction(self.act_add_impl)
         bar.addAction(self.act_delete_entry)
@@ -464,6 +575,7 @@ class MainWindow(QMainWindow):
         bar.addAction(self.act_open)
         bar.addAction(self.act_save)
         bar.addSeparator()
+        bar.addAction(self.act_readme_search)
         bar.addAction(self.act_copy_code)
         bar.addAction(self.act_manage_tags)
         bar.addAction(self.act_refresh)
@@ -510,6 +622,31 @@ class MainWindow(QMainWindow):
         self.detail_panel.add_implementation_requested.connect(self.add_implementation)
         self.detail_panel.edit_implementation_requested.connect(self.edit_implementation)
         self.detail_panel.delete_implementation_requested.connect(self.delete_implementation)
+
+        # 空间详情
+        self.space_panel.edit_requested.connect(lambda _id: self.edit_space())
+        self.space_panel.history_requested.connect(lambda _id: self.show_history_panel())
+        self.space_panel.favorite_toggled.connect(lambda _id: self.toggle_favorite())
+        self.space_panel.delete_requested.connect(lambda _id: self.delete_entry())
+        self.space_panel.duplicate_requested.connect(lambda _id: self.duplicate_entry())
+        self.space_panel.export_requested.connect(self.on_export_requested)
+        self.space_panel.copy_done.connect(self.set_status)
+        self.space_panel.open_file_requested.connect(self.open_space_file)
+        self.space_panel.add_file_requested.connect(self.add_space_file)
+        self.space_panel.edit_file_requested.connect(self.edit_space_file)
+        self.space_panel.delete_file_requested.connect(self.delete_space_path)
+        self.space_panel.add_directory_requested.connect(self.add_space_directory)
+        self.space_panel.rename_file_requested.connect(self.rename_space_file)
+
+        # 函数体详情
+        self.function_panel.edit_requested.connect(lambda _id: self.edit_function())
+        self.function_panel.history_requested.connect(lambda _id: self.show_history_panel())
+        self.function_panel.favorite_toggled.connect(lambda _id: self.toggle_favorite())
+        self.function_panel.delete_requested.connect(lambda _id: self.delete_entry())
+        self.function_panel.duplicate_requested.connect(lambda _id: self.duplicate_entry())
+        self.function_panel.export_requested.connect(self.on_export_requested)
+        self.function_panel.copy_done.connect(self.set_status)
+        self.function_panel.redetect_requested.connect(lambda _id: self.redetect_symbols())
 
         self.history_panel.restore_requested.connect(self.restore_revision)
         self.history_panel.undo_requested.connect(lambda _id: self.undo())
@@ -577,25 +714,47 @@ class MainWindow(QMainWindow):
     def refresh_detail(self) -> None:
         if self._tearing_down:
             return
-        entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
+        item = (
+            self.db.repository.get_item(self._current_entry_id)
+            if self._current_entry_id else None
+        )
         tag_colors = {key: info.color for key, info in self.db.repository.tags.items()}
-        self.detail_panel.set_entry(entry, tag_colors=tag_colors)
+
+        # 三类实体各有自己的详情面板, 按类别切到对应的一页
+        self._current_kind = getattr(item, "kind", self._current_kind) if item else "module"
+        if item is None:
+            self.detail_panel.set_entry(None)
+            self.space_panel.set_space(None)
+            self.function_panel.set_function(None)
+            self.detail_stack.setCurrentWidget(self.detail_panel)
+        elif self._current_kind == "space":
+            self.detail_stack.setCurrentWidget(self.space_panel)
+            self.space_panel.set_space(item, tag_colors=tag_colors)
+        elif self._current_kind == "function":
+            self.detail_stack.setCurrentWidget(self.function_panel)
+            self.function_panel.set_function(item)
+        else:
+            self.detail_stack.setCurrentWidget(self.detail_panel)
+            self.detail_panel.set_entry(item, tag_colors=tag_colors)
         self.refresh_history()
 
     def refresh_history(self) -> None:
         if self._tearing_down:
             return
-        entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
-        if entry is None:
+        item = (
+            self.db.repository.get_item(self._current_entry_id)
+            if self._current_entry_id else None
+        )
+        if item is None:
             self.history_panel.set_entry(None)
             return
-        revisions = self.db.repository.revisions(entry.id, descending=False)
-        cursor_rev = self.db.repository.history.current_revision(entry.id)
+        revisions = self.db.repository.revisions(item.id, descending=False)
+        cursor_rev = self.db.repository.history.current_revision(item.id)
         self.history_panel.set_entry(
-            entry,
+            item,
             list(reversed(revisions)),
-            can_undo=self.db.repository.can_undo(entry.id),
-            can_redo=self.db.repository.can_redo(entry.id),
+            can_undo=self.db.repository.can_undo(item.id),
+            can_redo=self.db.repository.can_redo(item.id),
             cursor_revision_id=cursor_rev.id if cursor_rev else "",
             diff_provider=lambda rid: self.db.repository.revision_diff(rid),
         )
@@ -614,29 +773,41 @@ class MainWindow(QMainWindow):
         repo = self.db.repository
         stats = repo.statistics()
         self.status_counts.setText(
-            f"显示 {visible} / 共 {stats['entries']} 条目 · {stats['implementations']} 实现 · "
-            f"{stats['revisions']} 修订"
+            f"显示 {visible} / 模块 {stats['modules']} · 空间 {stats['spaces']} · "
+            f"函数体 {stats['functions']} · {stats['revisions']} 修订"
         )
+        if hasattr(self, "kind_count_label"):
+            self.kind_count_label.setText(
+                f"模块 {stats['modules']} · 空间 {stats['spaces']} · 函数体 {stats['functions']}"
+            )
 
     def update_actions(self) -> None:
-        has_entry = bool(self._current_entry_id)
-        entry = self.db.repository.get(self._current_entry_id) if has_entry else None
-        self.act_edit_entry.setEnabled(has_entry)
-        self.act_add_impl.setEnabled(has_entry)
-        self.act_edit_impl.setEnabled(has_entry)
-        self.act_delete_entry.setEnabled(has_entry and not (entry and entry.deleted))
-        self.act_restore_entry.setEnabled(bool(entry and entry.deleted))
-        self.act_purge_entry.setEnabled(has_entry)
-        self.act_duplicate_entry.setEnabled(has_entry)
-        self.act_toggle_favorite.setEnabled(has_entry)
-        self.act_set_status.setEnabled(has_entry)
-        self.act_new_tag_on_entry.setEnabled(has_entry)
-        self.act_undo.setEnabled(has_entry and self.db.repository.can_undo(self._current_entry_id))
-        self.act_redo.setEnabled(has_entry and self.db.repository.can_redo(self._current_entry_id))
-        self.act_copy_code.setEnabled(has_entry)
-        self.act_copy_entry_md.setEnabled(has_entry)
-        self.act_copy_entry_json.setEnabled(has_entry)
+        has_item = bool(self._current_entry_id)
+        item = self.db.repository.get_item(self._current_entry_id) if has_item else None
+        kind = getattr(item, "kind", "module") if item else "module"
+
+        # 通用
+        self.act_delete_entry.setEnabled(has_item and not (item and item.deleted))
+        self.act_restore_entry.setEnabled(bool(item and item.deleted))
+        self.act_purge_entry.setEnabled(has_item)
+        self.act_duplicate_entry.setEnabled(has_item)
+        self.act_toggle_favorite.setEnabled(has_item)
+        self.act_set_status.setEnabled(has_item)
+        self.act_new_tag_on_entry.setEnabled(has_item)
+        self.act_undo.setEnabled(has_item and self.db.repository.can_undo(self._current_entry_id))
+        self.act_redo.setEnabled(has_item and self.db.repository.can_redo(self._current_entry_id))
+        self.act_copy_entry_md.setEnabled(has_item)
+        self.act_copy_entry_json.setEnabled(has_item)
         self.act_container_info.setEnabled(self.db.path is not None)
+
+        # 按类别启用专属动作
+        self.act_edit_entry.setEnabled(has_item and kind == "module")
+        self.act_add_impl.setEnabled(has_item and kind == "module")
+        self.act_edit_impl.setEnabled(has_item and kind == "module")
+        self.act_copy_code.setEnabled(has_item and kind == "module")
+        self.act_edit_space.setEnabled(has_item and kind == "space")
+        self.act_edit_function.setEnabled(has_item and kind == "function")
+        self.act_redetect_symbols.setEnabled(has_item and kind == "function")
 
     def set_status(self, message: str, timeout: int = 6000) -> None:
         self.status_message.setText(message)
@@ -655,24 +826,37 @@ class MainWindow(QMainWindow):
         if self._suppress_selection_signal or self._tearing_down:
             return
         self._current_entry_id = entry_id
+        item = self.db.repository.get_item(entry_id) if entry_id else None
+        self._current_kind = getattr(item, "kind", "module") if item else "module"
         self.refresh_detail()
         self.update_actions()
         self.update_status_entry()
 
     def update_status_entry(self) -> None:
-        entry = self.db.repository.get(self._current_entry_id) if self._current_entry_id else None
-        if entry is None:
+        item = (
+            self.db.repository.get_item(self._current_entry_id)
+            if self._current_entry_id else None
+        )
+        if item is None:
             self.status_entry.setText("")
             return
         self.status_entry.setText(
-            f"{entry.display_title} · {entry.status_label} · "
-            f"{len(entry.active_implementations)} 种语言 · {len(entry.tags)} 标签"
+            f"[{item.kind_label}] {item.display_title} · {item.status_label} · "
+            f"{item.badge_label} · {len(item.tags)} 标签"
         )
 
     def on_entry_activated(self, entry_id: str) -> None:
+        """双击列表项: 按类别打开对应的编辑器。"""
         self._current_entry_id = entry_id
+        item = self.db.repository.get_item(entry_id)
+        self._current_kind = getattr(item, "kind", "module") if item else "module"
         self.refresh_detail()
-        self.edit_entry()
+        if self._current_kind == "space":
+            self.edit_space()
+        elif self._current_kind == "function":
+            self.edit_function()
+        else:
+            self.edit_entry()
 
     def on_query_changed(self, text: str) -> None:
         self.query.text = text
@@ -1086,6 +1270,338 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("打开历史面板", self.show_history_panel)
         menu.exec(global_pos)
+
+    # ==================================================================================
+    # 独立空间 (库内的完整项目)
+    # ==================================================================================
+    def new_space(self) -> None:
+        dialog = SpaceEditorDialog(
+            self,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+        )
+        if dialog.exec() != SpaceEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        try:
+            space = self.db.repository.create_space(
+                str(data["name"]),
+                str(data["description"]),
+                str(data["prerequisites"]),
+                list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+                files=list(data["files"]),
+                entry_point=str(data["entry_point"]),
+            )
+        except RepositoryError as exc:
+            self.show_error("新建空间失败", str(exc))
+            return
+        self.set_kind_filter("all")
+        self._current_entry_id = space.id
+        self._current_kind = "space"
+        self.refresh_all(select_id=space.id)
+        self.set_status(
+            f"已新建空间《{space.display_title}》: {len(space.files)} 个文件 · {space.language_summary()}"
+        )
+
+    def edit_space(self, space_id: str = "") -> None:
+        space = self._current_space(space_id)
+        if space is None:
+            self.set_status("请先选中一个空间")
+            return
+        dialog = SpaceEditorDialog(
+            self,
+            space=space,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+        )
+        if dialog.exec() != SpaceEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        before = len(space.files)
+        try:
+            updated = self.db.repository.update_space(
+                space.id,
+                name=str(data["name"]),
+                description=str(data["description"]),
+                prerequisites=str(data["prerequisites"]),
+                tags=list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+                entry_point=str(data["entry_point"]),
+                files=list(data["files"]),
+            )
+        except RepositoryError as exc:
+            self.show_error("保存空间失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        changed = len(updated.files) - before
+        self.set_status(
+            f"已保存空间《{updated.display_title}》"
+            + (f" (文件数 {before} → {len(updated.files)})" if changed else "")
+            + f" · {updated.language_summary()}"
+        )
+
+    def _current_space(self, space_id: str = ""):
+        if space_id:
+            return self.db.repository.spaces.get(space_id)
+        item = self.db.repository.get_item(self._current_entry_id) if self._current_entry_id else None
+        if getattr(item, "kind", "") == "space":
+            return item
+        return None
+
+    def _require_space(self, space_id: str):
+        space = self.db.repository.spaces.get(space_id)
+        if space is None:
+            self.set_status("请先选中一个空间")
+        return space
+
+    def open_space_file(self, space_id: str, path: str) -> None:
+        if self._require_space(space_id) is None:
+            return
+        self.space_panel.show_file(path)
+        self.set_status(f"已打开 {path}")
+
+    def add_space_file(self, space_id: str, directory: str = "") -> None:
+        """新建一个文件。``space_id`` 允许带 ``\\x00<目录>`` 后缀以指定所在目录。"""
+        if "\x00" in space_id:
+            space_id, directory = space_id.split("\x00", 1)
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        default = f"{directory}/new_file.py" if directory else "new_file.py"
+        text, ok = QInputDialog.getText(self, "新建文件", "相对路径 (用 / 分隔):", text=default)
+        if not ok:
+            return
+        path = str(text).strip()
+        if not path:
+            return
+        try:
+            file = self.db.repository.put_space_file(space.id, path, "")
+        except RepositoryError as exc:
+            self.show_error("新建文件失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        self.space_panel.show_file(file.path)
+        self.edit_space_file(space.id, file.path)
+
+    def edit_space_file(self, space_id: str, path: str) -> None:
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        file = space.get_file(path)
+        if file is None:
+            self.set_status(f"文件不存在: {path}")
+            return
+        if file.binary:
+            self.show_error("无法编辑", f"{path} 被标记为二进制文件, 只记录了大小。")
+            return
+
+        dialog = ThemedDialog(self)
+        dialog.setWindowTitle(f"编辑 {path}")
+        dialog.setMinimumSize(820, 620)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        info = QLabel(f"{path} · {get_language(file.language).name}", dialog)
+        info.setObjectName("MutedLabel")
+        layout.addWidget(info)
+        editor = CodeEditor(dialog, language=file.language, theme=self.theme)
+        editor.setPlainText(file.content)
+        layout.addWidget(editor, 1)
+        note_row = QHBoxLayout()
+        note_row.addWidget(QLabel("文件说明", dialog))
+        note_edit = QLineEdit(dialog)
+        note_edit.setPlaceholderText("可选")
+        note_edit.setText(file.note)
+        note_row.addWidget(note_edit, 1)
+        layout.addLayout(note_row)
+        buttons = QDialogButtonBox(dialog)
+        buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole).clicked.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != ThemedDialog.DialogCode.Accepted:
+            return
+        try:
+            self.db.repository.put_space_file(
+                space.id, path, editor.toPlainText(), note=note_edit.text().strip()
+            )
+        except RepositoryError as exc:
+            self.show_error("保存文件失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        self.space_panel.show_file(path)
+        self.set_status(f"已保存 {path}")
+
+    def add_space_directory(self, space_id: str) -> None:
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        text, ok = QInputDialog.getText(self, "新建目录", "目录路径 (用 / 分隔):", text="src")
+        if not ok or not text.strip():
+            return
+        placeholder = f"{normalize_project_path(text)}/.gitkeep"
+        try:
+            self.db.repository.put_space_file(space.id, placeholder, "")
+        except RepositoryError as exc:
+            self.show_error("新建目录失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        self.set_status(f"已新建目录 (占位文件 {placeholder})")
+
+    def rename_space_file(self, space_id: str, path: str) -> None:
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        text, ok = QInputDialog.getText(self, "重命名文件", "新路径:", text=path)
+        if not ok or not text.strip() or text.strip() == path:
+            return
+        try:
+            self.db.repository.rename_space_file(space.id, path, text.strip())
+        except RepositoryError as exc:
+            self.show_error("重命名失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        self.set_status(f"已重命名 {path} → {normalize_project_path(text)}")
+
+    def delete_space_path(self, space_id: str, path: str) -> None:
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        # 目录还是文件? 目录删除会连带其下全部文件
+        is_directory = space.get_file(path) is None
+        answer = QMessageBox.question(
+            self,
+            "删除目录" if is_directory else "删除文件",
+            f"确定从空间《{space.display_title}》里删除 {path} 吗?"
+            + ("\n(该目录下的所有文件都会被删除)" if is_directory else "")
+            + "\n\n改动会进入历史, 可以回滚。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if is_directory:
+            count = self.db.repository.delete_space_directory(space.id, path)
+            self.set_status(f"已删除目录 {path}/ (共 {count} 个文件)")
+        else:
+            self.db.repository.delete_space_file(space.id, path)
+            self.set_status(f"已删除文件 {path}")
+        self.refresh_all(select_id=space.id)
+
+    def search_readmes(self) -> None:
+        dialog = ReadmeSearchDialog(self.db.repository, self, theme=self.theme)
+        dialog.open_requested.connect(self._open_readme_hit)
+        dialog.exec()
+
+    def _open_readme_hit(self, space_id: str, path: str) -> None:
+        self.set_kind_filter("all")
+        self._current_entry_id = space_id
+        self._current_kind = "space"
+        self.refresh_all(select_id=space_id)
+        self.space_panel.show_file(path)
+        self.set_status(f"已跳到 {path}")
+
+    # ==================================================================================
+    # 函数体 (自动检测变量 + 含义表)
+    # ==================================================================================
+    def new_function(self) -> None:
+        dialog = FunctionEditorDialog(
+            self,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+        )
+        if dialog.exec() != FunctionEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        try:
+            function = self.db.repository.create_function(
+                str(data["name"]),
+                str(data["language"]),
+                str(data["code"]),
+                signature=str(data["signature"]),
+                description=str(data["description"]),
+                prerequisites=str(data["prerequisites"]),
+                symbols=list(data["symbols"]),
+                tags=list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+                detect=False,   # 符号表已经由对话框填好了
+            )
+        except RepositoryError as exc:
+            self.show_error("新建函数体失败", str(exc))
+            return
+        self.set_kind_filter("all")
+        self._current_entry_id = function.id
+        self._current_kind = "function"
+        self.refresh_all(select_id=function.id)
+        missing = len(function.required_symbols_missing_meaning)
+        self.set_status(
+            f"已新建函数体《{function.display_title}》({function.language_name}) · "
+            f"{len(function.symbols)} 个变量"
+            + (f" · {missing} 个待填含义" if missing else " · 含义已完整")
+        )
+
+    def edit_function(self, function_id: str = "") -> None:
+        function = self._current_function(function_id)
+        if function is None:
+            self.set_status("请先选中一个函数体")
+            return
+        dialog = FunctionEditorDialog(
+            self,
+            function=function,
+            existing_tags=self.db.repository.all_tags(),
+            theme=self.theme,
+        )
+        if dialog.exec() != FunctionEditorDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        try:
+            updated = self.db.repository.update_function(
+                function.id,
+                name=str(data["name"]),
+                language=str(data["language"]),
+                code=str(data["code"]),
+                signature=str(data["signature"]),
+                description=str(data["description"]),
+                prerequisites=str(data["prerequisites"]),
+                symbols=list(data["symbols"]),
+                tags=list(data["tags"]),
+                status=str(data["status"]),
+                favorite=bool(data["favorite"]),
+            )
+        except RepositoryError as exc:
+            self.show_error("保存函数体失败", str(exc))
+            return
+        self.refresh_all(select_id=function.id)
+        missing = len(updated.required_symbols_missing_meaning)
+        self.set_status(
+            f"已保存函数体《{updated.display_title}》· {len(updated.symbols)} 个变量"
+            + (f" · {missing} 个待填含义" if missing else " · 含义已完整")
+        )
+
+    def _current_function(self, function_id: str = ""):
+        if function_id:
+            return self.db.repository.functions.get(function_id)
+        item = self.db.repository.get_item(self._current_entry_id) if self._current_entry_id else None
+        if getattr(item, "kind", "") == "function":
+            return item
+        return None
+
+    def redetect_symbols(self, function_id: str = "") -> None:
+        function = self._current_function(function_id)
+        if function is None:
+            self.set_status("请先选中一个函数体")
+            return
+        added, updated = self.db.repository.detect_function_symbols(function.id)
+        self.refresh_all(select_id=function.id)
+        missing = len(updated.required_symbols_missing_meaning)
+        self.set_status(
+            f"检测完成: 新增 {added} 个变量, 共 {len(updated.symbols)} 个"
+            + (f" · {missing} 个必填项待填写" if missing else " · 含义已完整")
+            + " (已填写的含义保持不变)"
+        )
 
     # ==================================================================================
     # 复制 / 导出

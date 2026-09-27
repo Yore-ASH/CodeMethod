@@ -281,6 +281,153 @@ mod tests {
         status="idea",
     )
 
+    # ---- 独立空间: 一个完整的多文件小项目 ----
+    from .core.spaces import ProjectFile
+
+    space = repo.create_space(
+        name="tokenizer-service",
+        description=(
+            "一个可以把任意文本切成 token 的小服务。\n"
+            "目录结构: src/ 放实现, tests/ 放测试, docs/ 放说明。"
+        ),
+        prerequisites="Python 3.10+ / Go 1.21+；不需要数据库；监听 8080。",
+        tags=["project", "demo", "service"],
+        status="in_progress",
+        favorite=True,
+        entry_point="src/tokenizer.py",
+    )
+    space_files = [
+        ("README.md", """# tokenizer-service
+
+把文本切成 token 的小服务, 提供 Python 与 Go 两套实现。
+
+## 目录
+
+- `src/` — 实现
+- `tests/` — 测试
+- `docs/` — 说明
+
+## 快速开始
+
+```bash
+python src/tokenizer.py "hello world"
+```
+
+## 说明
+
+服务默认监听 **8080**, 支持 HTTP 与 gRPC 两种协议。
+分词规则见 `docs/RULES.md`, 目前只做空白切分。
+"""),
+        ("docs/RULES.md", """# 分词规则
+
+1. 以空白字符切分
+2. 连续空白视为一个分隔符
+3. 保留大小写
+
+后续计划: 支持正则自定义分隔符、支持中文分词。
+"""),
+        ("src/tokenizer.py", '''"""把文本切成 token。"""
+
+from typing import List
+
+
+def tokenize(text: str, keep_case: bool = True) -> List[str]:
+    """按空白切分, 忽略连续空白。"""
+    tokens = text.split()
+    if not keep_case:
+        tokens = [t.lower() for t in tokens]
+    return tokens
+
+
+def count(text: str) -> int:
+    return len(tokenize(text))
+'''),
+        ("src/main.py", '''"""命令行入口。"""
+
+import sys
+
+from tokenizer import tokenize
+
+
+def main(argv: list[str]) -> int:
+    text = " ".join(argv[1:]) or "hello world"
+    for index, token in enumerate(tokenize(text), 1):
+        print(f"{index:>3}  {token}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+'''),
+        ("src/server.go", '''package main
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+// split 按空白切分, 与 Python 版保持同样的语义。
+func split(text string) []string {
+	return strings.Fields(text)
+}
+
+func main() {
+	http.HandleFunc("/tokenize", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%q", split(r.URL.Query().Get("text")))
+	})
+	http.ListenAndServe(":8080", nil)
+}
+'''),
+        ("tests/test_tokenizer.py", '''import unittest
+
+from tokenizer import tokenize
+
+
+class TestTokenizer(unittest.TestCase):
+    def test_simple(self):
+        self.assertEqual(tokenize("a b c"), ["a", "b", "c"])
+
+    def test_collapses_whitespace(self):
+        self.assertEqual(tokenize("a   b"), ["a", "b"])
+'''),
+    ]
+    for path, content in space_files:
+        repo.put_space_file(space.id, path, content)
+
+    # ---- 函数体: 自动检测变量并要求填写含义 ----
+    function = repo.create_function(
+        "mod_pow",
+        "python",
+        '''def mod_pow(base: int, exp: int, modulus: int = 1000000007) -> int:
+    """快速幂取模: 计算 (base ** exp) % modulus, 全程不溢出。"""
+    result = 1
+    base %= modulus
+    while exp > 0:
+        if exp & 1:
+            result = result * base % modulus
+        exp >>= 1
+        base = base * base % modulus
+    return result
+''',
+        description="经典的二进制快速幂, O(log exp)。",
+        prerequisites="Python 3.6+；仅用整数运算, 无依赖。",
+        tags=["algorithm", "math", "demo"],
+        status="done",
+    )
+    # 给必填项填上含义, 演示"变量含义表"
+    meanings = {
+        "base": "底数",
+        "exp": "指数",
+        "modulus": "取模的模数, 默认 1e9+7",
+        "result": "累计的结果",
+        "return": "base 的 exp 次方对 modulus 取模的结果",
+    }
+    for symbol in function.symbols:
+        if symbol.name in meanings:
+            symbol.meaning = meanings[symbol.name]
+    repo.set_function_symbols(function.id, function.symbols, summary="填写变量含义")
+
     return repo
 
 
@@ -389,6 +536,65 @@ def run_self_test(report_path: Optional[str] = None) -> int:
             )
             check("前置要求存盘后仍按语言保留", restored_needs == needs)
 
+        # ---- 三类实体都能存进同一个容器 ----
+        stats = repo.statistics()
+        check(
+            "模块 / 空间 / 函数体 同时存在",
+            stats["modules"] > 0 and stats["spaces"] > 0 and stats["functions"] > 0,
+            f"{stats['modules']} 模块 · {stats['spaces']} 空间 · {stats['functions']} 函数体",
+        )
+        check(
+            "容器清单统计三类实体",
+            reopened.repository.statistics()["spaces"] == stats["spaces"],
+        )
+
+        # 独立空间: 项目结构完整往返
+        sample_space = next(iter(repo.spaces.values()), None)
+        if sample_space is None:
+            check("示例库含独立空间", False)
+        else:
+            restored_space = reopened.repository.spaces.get(sample_space.id)
+            check(
+                "空间文件全部存进容器",
+                restored_space is not None
+                and {f.path for f in restored_space.files} == {f.path for f in sample_space.files},
+                f"{len(sample_space.files)} 个文件 · {sample_space.language_summary()}",
+            )
+            check(
+                "空间语言占比可计算",
+                bool(sample_space.language_shares())
+                and abs(sum(s.percent for s in sample_space.language_shares()) - 100.0) < 0.5,
+                sample_space.language_summary(),
+            )
+            hits = repo.space_readme_hits("token")
+            check(
+                "README 自动索引可检索",
+                len(hits) > 0,
+                f"{len(sample_space.readme_files)} 个 README, 命中 {len(hits)} 处",
+            )
+
+        # 函数体: 变量检测 + 含义表往返
+        sample_function = next(iter(repo.functions.values()), None)
+        if sample_function is None:
+            check("示例库含函数体", False)
+        else:
+            check(
+                "自动检测到变量声明",
+                len(sample_function.symbols) > 0,
+                ", ".join(s.name for s in sample_function.symbols[:6]),
+            )
+            check(
+                "变量含义已填写",
+                not sample_function.required_symbols_missing_meaning,
+            )
+            restored_function = reopened.repository.functions.get(sample_function.id)
+            check(
+                "变量含义存盘后保留",
+                restored_function is not None
+                and [(s.name, s.kind, s.meaning) for s in restored_function.symbols]
+                == [(s.name, s.kind, s.meaning) for s in sample_function.symbols],
+            )
+
         md = os.path.join(tmp, "lib.md")
         js = os.path.join(tmp, "lib.json")
         zp = os.path.join(tmp, "lib.zip")
@@ -402,6 +608,18 @@ def run_self_test(report_path: Optional[str] = None) -> int:
             "ZIP 回读",
             len(exporter.read_zip_export(zp)["entries"]) == len(repo.entries),
         )
+        # 空间在 ZIP 里应该还原成真实的项目目录树
+        if sample_space is not None:
+            import zipfile
+
+            with zipfile.ZipFile(zp) as archive:
+                names = archive.namelist()
+            nested = [n for n in names if n.startswith("spaces/") and n.count("/") >= 2]
+            check(
+                "ZIP 里空间是真实目录树",
+                len(nested) >= len(sample_space.files),
+                f"{len(nested)} 个文件按原路径还原",
+            )
 
         # 4) 界面构建 (offscreen, 覆盖 Qt 插件是否被正确打包)
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -418,9 +636,10 @@ def run_self_test(report_path: Optional[str] = None) -> int:
         for _ in range(4):
             app.processEvents()
         rows = window.entry_list.entry_model.rowCount()
-        check("主窗口构建", rows == 4, f"列表 {rows} 行")
+        expected_rows = stats["modules"] + stats["spaces"] + stats["functions"]
+        check("主窗口构建", rows == expected_rows, f"列表 {rows} 行 / 期望 {expected_rows}")
 
-        # 选中一个"有多种语言实现"的条目, 顺带验证多语言页签在打包产物里也正常
+        # ---- 模块: 多语言页签 ----
         target = next(
             (e for e in window.db.repository.entries_list() if len(e.active_implementations) > 1),
             None,
@@ -449,6 +668,65 @@ def run_self_test(report_path: Optional[str] = None) -> int:
                 len(window.detail_panel._previews) == len(target.active_implementations),
                 f"{len(window.detail_panel._previews)} 个代码视图",
             )
+
+        # ---- 空间: 详情面板切到项目结构 ----
+        # 注意: 这里的示例必须取自**窗口自己的**代码库 —— 上面的 repo 是另一份实例,
+        # id 并不相同, 用它的 id 去选中会选不中。
+        ui_repo = window.db.repository
+        ui_space = next(iter(ui_repo.spaces.values()), None)
+        ui_function = next(iter(ui_repo.functions.values()), None)
+        if ui_space is not None:
+            window.entry_list.select_entry(ui_space.id)
+            window.refresh_detail()
+            for _ in range(3):
+                app.processEvents()
+            check(
+                "空间详情面板被激活",
+                window.detail_stack.currentWidget() is window.space_panel,
+            )
+            space_shown = window.space_panel.current_space()
+            check("空间详情跟随", space_shown is not None and space_shown.id == ui_space.id)
+            check(
+                "项目结构树已填充",
+                window.space_panel.tree.topLevelItemCount() > 0,
+                f"{len(ui_space.files)} 个文件",
+            )
+            check(
+                "语言占比条已渲染",
+                len(window.space_panel.language_bar._shares) > 0,
+                ui_space.language_summary(),
+            )
+
+        # ---- 函数体: 详情面板切到变量表 ----
+        if ui_function is not None:
+            window.entry_list.select_entry(ui_function.id)
+            window.refresh_detail()
+            for _ in range(3):
+                app.processEvents()
+            check(
+                "函数体详情面板被激活",
+                window.detail_stack.currentWidget() is window.function_panel,
+            )
+            function_shown = window.function_panel.current_function()
+            check(
+                "变量含义表已填充",
+                function_shown is not None
+                and window.function_panel.symbol_table.rowCount() == len(function_shown.symbols),
+                f"{window.function_panel.symbol_table.rowCount()} 行",
+            )
+
+        # ---- 类别切换 ----
+        window.set_kind_filter("space")
+        for _ in range(3):
+            app.processEvents()
+        check(
+            "类别切换只看空间",
+            window.entry_list.entry_model.rowCount() == stats["spaces"],
+            f"{window.entry_list.entry_model.rowCount()} 行",
+        )
+        window.set_kind_filter("all")
+        for _ in range(3):
+            app.processEvents()
 
         # 标记为已保存, 否则 close() 会弹出"是否保存"的模态框把自检卡死
         window.db.repository.mark_clean()

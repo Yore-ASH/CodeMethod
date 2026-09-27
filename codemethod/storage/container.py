@@ -230,6 +230,7 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             tag_counter[str(tag)] = tag_counter.get(str(tag), 0) + 1
         index.append(
             {
+                "kind": "module",
                 "id": entry.get("id"),
                 "title": entry.get("title"),
                 "status": entry.get("status"),
@@ -238,6 +239,80 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
                 "deleted": bool(entry.get("deleted")),
                 "updated_at": entry.get("updated_at"),
                 "revisions": len((timelines or {}).get(entry.get("id"), []) or []),
+            }
+        )
+
+    # ---- 独立空间 (文件都存进容器里, 清单只记路径与大小) ----
+    spaces = repository_data.get("spaces") or []
+    space_index: List[Dict[str, Any]] = []
+    space_file_total = 0
+    readme_total = 0
+    for space in spaces:
+        if not isinstance(space, dict):
+            continue
+        files = [f for f in (space.get("files") or []) if isinstance(f, dict)]
+        space_file_total += len(files)
+        readme_total += sum(
+            1
+            for f in files
+            if str(f.get("path") or "").rsplit("/", 1)[-1].lower().startswith("readme")
+        )
+        langs = sorted({str(f.get("language")) for f in files})
+        for lang in langs:
+            language_counter[lang] = language_counter.get(lang, 0) + 1
+        for tag in space.get("tags") or []:
+            tag_counter[str(tag)] = tag_counter.get(str(tag), 0) + 1
+        space_index.append(
+            {
+                "kind": "space",
+                "id": space.get("id"),
+                "title": space.get("name"),
+                "status": space.get("status"),
+                "tags": list(space.get("tags") or []),
+                "languages": langs,
+                "file_count": len(files),
+                "bytes": sum(int(f.get("size") or 0) for f in files),
+                "readmes": [
+                    str(f.get("path")) for f in files
+                    if str(f.get("path") or "").rsplit("/", 1)[-1].lower().startswith("readme")
+                ],
+                "deleted": bool(space.get("deleted")),
+                "updated_at": space.get("updated_at"),
+                "revisions": len((timelines or {}).get(space.get("id"), []) or []),
+            }
+        )
+
+    # ---- 函数体 ----
+    functions = repository_data.get("functions") or []
+    function_index: List[Dict[str, Any]] = []
+    symbol_total = 0
+    symbol_missing = 0
+    for function in functions:
+        if not isinstance(function, dict):
+            continue
+        symbols = [s for s in (function.get("symbols") or []) if isinstance(s, dict)]
+        symbol_total += len(symbols)
+        symbol_missing += sum(1 for s in symbols if not str(s.get("meaning") or "").strip())
+        lang = str(function.get("language") or "")
+        if lang:
+            language_counter[lang] = language_counter.get(lang, 0) + 1
+        for tag in function.get("tags") or []:
+            tag_counter[str(tag)] = tag_counter.get(str(tag), 0) + 1
+        function_index.append(
+            {
+                "kind": "function",
+                "id": function.get("id"),
+                "title": function.get("name"),
+                "status": function.get("status"),
+                "tags": list(function.get("tags") or []),
+                "languages": [lang] if lang else [],
+                "symbol_count": len(symbols),
+                "symbols_missing_meaning": sum(
+                    1 for s in symbols if not str(s.get("meaning") or "").strip()
+                ),
+                "deleted": bool(function.get("deleted")),
+                "updated_at": function.get("updated_at"),
+                "revisions": len((timelines or {}).get(function.get("id"), []) or []),
             }
         )
 
@@ -254,10 +329,20 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             "revisions": revision_total,
             "tags": len(tag_counter),
             "languages": sorted(language_counter),
+            # 三类实体
+            "modules": len(index),
+            "spaces": len(space_index),
+            "functions": len(function_index),
+            "space_files": space_file_total,
+            "space_readmes": readme_total,
+            "function_symbols": symbol_total,
+            "symbols_missing_meaning": symbol_missing,
         },
         "languages": language_counter,
         "tags": tag_counter,
         "entries": index,
+        "spaces": space_index,
+        "functions": function_index,
         "integrity": {
             "algorithm": "sha256",
             "digest": hashlib.sha256(payload_bytes).hexdigest(),

@@ -104,8 +104,8 @@ class EntryListModel(QAbstractListModel):
 
     # ---- 内部 ----
     def _tooltip(self, entry: Entry) -> str:
-        lines = [entry.display_title, ""]
-        if entry.description:
+        lines = [f"[{entry.kind_label}] {entry.display_title}", ""]
+        if getattr(entry, "description", ""):
             description = entry.description.strip().splitlines()[0][:120]
             lines.append(description)
         lines.append(f"状态: {entry.status_label}")
@@ -113,7 +113,14 @@ class EntryListModel(QAbstractListModel):
             lines.append("标签: " + ", ".join("#" + t for t in entry.tags))
         if entry.languages:
             lines.append("语言: " + ", ".join(get_language(l).name for l in entry.languages))
-        lines.append(f"实现: {len(entry.active_implementations)} 个 · 代码 {entry.total_lines} 行")
+        # 三类实体的"规模"含义不同, 用统一的 badge 文案
+        lines.append(entry.badge_label)
+        if getattr(entry, "kind", "") == "space":
+            lines.append("占比: " + entry.language_summary())
+        if getattr(entry, "kind", "") == "function":
+            missing = len(entry.required_symbols_missing_meaning)
+            if missing:
+                lines.append(f"⚠ {missing} 个变量还没填含义")
         lines.append(f"修订: {self._revision_counts.get(entry.id, 0)} 次")
         updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.updated_at))
         lines.append(f"更新: {updated}")
@@ -235,21 +242,29 @@ class EntryDelegate(QStyledItemDelegate):
                 elided_meta,
             )
 
-        # ---- 实现数量徽标 ----
-        impl_count = len(entry.active_implementations)
-        if impl_count:
-            badge = f"{impl_count} 实现"
-            badge_font = ui_font(max(7, theme.ui_font_size - 1))
-            painter.setFont(badge_font)
-            badge_width = QFontMetricsF(badge_font).horizontalAdvance(badge) + 12
-            badge_rect = QRect(
-                int(content_right - badge_width), int(y - 1), int(badge_width), 16
-            )
+        # ---- 类别 + 数量徽标 (模块"N 实现" / 空间"N 文件" / 函数体"N 变量") ----
+        # 用统一的 badge_label 而不是某个类独有的属性 —— 三类实体共用这一个委托
+        badge = entry.badge_label if entry.badge_count else ""
+        kind_badge = entry.kind_label
+        badge_font = ui_font(max(7, theme.ui_font_size - 1))
+        painter.setFont(badge_font)
+        metrics = QFontMetricsF(badge_font)
+
+        right = content_right
+        for text, color in ((badge, theme.text_muted), (kind_badge, theme.accent)):
+            if not text:
+                continue
+            width = metrics.horizontalAdvance(text) + 12
+            badge_rect = QRect(int(right - width), int(y - 1), int(width), 16)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(theme.sidebar_section))
             painter.drawRoundedRect(badge_rect, 8, 8)
-            painter.setPen(QColor(theme.text_muted))
-            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge)
+            pen = QColor(color)
+            if text == kind_badge:
+                pen.setAlpha(220)
+            painter.setPen(pen)
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+            right -= width + 4
 
         # 分隔线
         painter.setPen(QPen(QColor(theme.border), 1))

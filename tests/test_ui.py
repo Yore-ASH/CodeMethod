@@ -235,8 +235,83 @@ class TestMainWindow(_TrackedWidgets):
 
     def test_window_builds_with_demo_library(self):
         window, db = self._make_window()
-        self.assertEqual(len(window.entry_list.entry_model.entries()), 4)
+        stats = db.repository.statistics()
+        expected = stats["modules"] + stats["spaces"] + stats["functions"]
+        self.assertEqual(len(window.entry_list.entry_model.entries()), expected)
+        # 示例库现在同时包含三类实体
+        self.assertGreaterEqual(stats["modules"], 1)
+        self.assertGreaterEqual(stats["spaces"], 1)
+        self.assertGreaterEqual(stats["functions"], 1)
         self.assertGreater(window.tag_panel.list.count(), 0)
+        window.close()
+
+    def test_kind_filter_switches_list(self):
+        window, db = self._make_window()
+        stats = db.repository.statistics()
+        for kind, expected in (
+            ("module", stats["modules"]),
+            ("space", stats["spaces"]),
+            ("function", stats["functions"]),
+        ):
+            window.set_kind_filter(kind)
+            self.app.processEvents()
+            self.assertEqual(
+                len(window.entry_list.entry_model.entries()), expected, kind
+            )
+            self.assertTrue(window._kind_buttons[kind].isChecked())
+        window.set_kind_filter("all")
+        self.app.processEvents()
+        self.assertEqual(
+            len(window.entry_list.entry_model.entries()),
+            stats["modules"] + stats["spaces"] + stats["functions"],
+        )
+        window.close()
+
+    def test_selecting_space_activates_space_panel(self):
+        window, db = self._make_window()
+        space = next(iter(db.repository.spaces.values()), None)
+        self.assertIsNotNone(space, "示例库应包含一个空间")
+        window.entry_list.select_entry(space.id)
+        window.refresh_detail()
+        self.app.processEvents()
+
+        self.assertIs(window.detail_stack.currentWidget(), window.space_panel)
+        self.assertEqual(window.space_panel.current_space().id, space.id)
+        self.assertEqual(window._current_kind, "space")
+        # 项目结构树与语言占比都要有内容
+        self.assertGreater(window.space_panel.tree.topLevelItemCount(), 0)
+        self.assertGreater(len(window.space_panel.language_bar._shares), 0)
+        window.close()
+
+    def test_selecting_function_activates_function_panel(self):
+        window, db = self._make_window()
+        function = next(iter(db.repository.functions.values()), None)
+        self.assertIsNotNone(function, "示例库应包含一个函数体")
+        window.entry_list.select_entry(function.id)
+        window.refresh_detail()
+        self.app.processEvents()
+
+        self.assertIs(window.detail_stack.currentWidget(), window.function_panel)
+        self.assertEqual(window.function_panel.current_function().id, function.id)
+        self.assertEqual(window._current_kind, "function")
+        self.assertEqual(
+            window.function_panel.symbol_table.rowCount(), len(function.symbols)
+        )
+        window.close()
+
+    def test_space_and_function_share_one_history_panel(self):
+        window, db = self._make_window()
+        space = next(iter(db.repository.spaces.values()))
+        window.entry_list.select_entry(space.id)
+        window.refresh_detail()
+        self.app.processEvents()
+        self.assertGreater(window.history_panel.list.count(), 0)
+
+        function = next(iter(db.repository.functions.values()))
+        window.entry_list.select_entry(function.id)
+        window.refresh_detail()
+        self.app.processEvents()
+        self.assertGreater(window.history_panel.list.count(), 0)
         window.close()
 
     def test_selecting_entry_fills_detail_and_history(self):
@@ -275,13 +350,29 @@ class TestMainWindow(_TrackedWidgets):
         window.close()
 
     def test_search_filters_and_clears(self):
-        window, _db = self._make_window()
+        window, db = self._make_window()
+        stats = db.repository.statistics()
+        total = stats["modules"] + stats["spaces"] + stats["functions"]
+
         window.search_bar.set_text("lang:python")
         self.app.processEvents()
-        self.assertGreater(len(window.entry_list.entry_model.entries()), 0)
+        filtered = len(window.entry_list.entry_model.entries())
+        self.assertGreater(filtered, 0)
+        self.assertLess(filtered, total)
+
         window.clear_search()
         self.app.processEvents()
-        self.assertEqual(len(window.entry_list.entry_model.entries()), 4)
+        self.assertEqual(len(window.entry_list.entry_model.entries()), total)
+        window.close()
+
+    def test_readme_qualifier_only_matches_spaces(self):
+        """readme: 只搜空间里的 README 文件。"""
+        window, db = self._make_window()
+        window.search_bar.set_text("readme:token")
+        self.app.processEvents()
+        found = window.entry_list.entry_model.entries()
+        self.assertTrue(found, "示例空间的 README 里应该有 token")
+        self.assertTrue(all(item.kind == "space" for item in found))
         window.close()
 
     def test_undo_redo_through_window(self):

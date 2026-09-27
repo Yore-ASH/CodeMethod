@@ -210,6 +210,23 @@ class Entry:
         self.implementations = list(self.implementations)
 
     # ---- 便捷属性 ----
+    #
+    # 下面这几个属性同时存在于 Space / Function 上, 构成三类实体共用的最小接口,
+    # 因此同一个列表模型与绘制委托可以原样渲染模块、空间与函数体。
+    kind = "module"
+
+    @property
+    def kind_label(self) -> str:
+        return "模块"
+
+    @property
+    def badge_count(self) -> int:
+        return len(self.active_implementations)
+
+    @property
+    def badge_label(self) -> str:
+        return f"{len(self.active_implementations)} 实现"
+
     @property
     def languages(self) -> List[str]:
         seen: List[str] = []
@@ -365,6 +382,8 @@ class Revision:
     timestamp: float = field(default_factory=utcnow)
     parent_id: Optional[str] = None
     checksum: str = ""
+    # 快照属于哪一类实体 (module / space / function)。旧文件没有这个字段, 按 module 处理。
+    kind: str = "module"
 
     @property
     def action_label(self) -> str:
@@ -372,7 +391,12 @@ class Revision:
 
     @property
     def entry_title(self) -> str:
-        return str(self.snapshot.get("title") or "未命名条目")
+        # 模块用 title, 空间/函数体用 name —— 历史面板统一显示成"标题"
+        return str(self.snapshot.get("title") or self.snapshot.get("name") or "未命名")
+
+    @property
+    def kind_label(self) -> str:
+        return {"module": "模块", "space": "空间", "function": "函数体"}.get(self.kind, self.kind)
 
     @property
     def time_label(self) -> str:
@@ -388,6 +412,7 @@ class Revision:
             "timestamp": self.timestamp,
             "parent_id": self.parent_id,
             "checksum": self.checksum,
+            "kind": self.kind,
             "snapshot": self.snapshot,
         }
 
@@ -402,6 +427,7 @@ class Revision:
             timestamp=float(data.get("timestamp") or utcnow()),
             parent_id=data.get("parent_id"),
             checksum=str(data.get("checksum") or ""),
+            kind=str(data.get("kind") or "module"),
             snapshot=dict(data.get("snapshot") or {}),
         )
 

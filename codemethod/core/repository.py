@@ -10,8 +10,16 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .history import HistoryStore, build_revision_diff, checksum_of, summarize_changes, take_snapshot
+from .history import (
+    HistoryStore,
+    build_revision_diff,
+    checksum_of,
+    kind_of_snapshot,
+    summarize_changes,
+    take_snapshot,
+)
 from .languages import DEFAULT_LANGUAGE, get_language, normalize_language
+from .functions import Function, Symbol
 from .models import (
     ACTION_LABELS,
     STATUS_ORDER,
@@ -23,6 +31,15 @@ from .models import (
     new_id,
     tag_key,
     utcnow,
+)
+from .spaces import (
+    MAX_FILES_PER_SPACE,
+    MAX_FILE_BYTES,
+    ProjectFile,
+    Space,
+    is_binary_path,
+    normalize_project_path,
+    search_readmes,
 )
 
 SCHEMA_VERSION = 1
@@ -64,8 +81,7 @@ class TagInfo:
 
 
 # 新建标签时循环取用的调色板
-TAG_PALETTE: Sequence[str] = (
-    "#569CD6",
+TAG_PALETTE: Sequence[str] = (    "#569CD6",
     "#4EC9B0",
     "#DCDCAA",
     "#CE9178",
@@ -80,9 +96,26 @@ TAG_PALETTE: Sequence[str] = (
 )
 
 
+def detect_function_symbols(function: Function) -> int:
+    """检测 ``function`` 的代码里的变量声明并并入它的符号表, 返回新增数量。
+
+    检测器在 :mod:`codemethod.core.symbols`, 是纯标准库的启发式实现
+    (正则 + 注释/字符串屏蔽); 这里只负责把结果交给
+    :meth:`Function.apply_detected`, 由后者保证**不覆盖用户已填写的含义**。
+    """
+    try:
+        from .symbols import detect_symbols
+    except ImportError:  # pragma: no cover - symbols 模块缺失时退化为不检测
+        return 0
+    try:
+        detected = detect_symbols(function.language, function.code, function.name)
+    except Exception:  # pragma: no cover - 检测器保证不抛, 这里再兜一层
+        return 0
+    return function.apply_detected(detected)
+
+
 class Repository:
     """一个 CodeMethod 库 (对应磁盘上的一个 ``.cmdb`` / ``.cmj`` 文件)。"""
-
     def __init__(
         self,
         name: str = "未命名代码库",
@@ -98,6 +131,8 @@ class Repository:
         self.created_at = utcnow()
         self.modified_at = self.created_at
         self.entries: Dict[str, Entry] = {}
+        self.spaces: Dict[str, Space] = {}
+        self.functions: Dict[str, Function] = {}
         self.tags: Dict[str, TagInfo] = {}
         self.history = HistoryStore(max_revisions=max_revisions)
         self.extra: Dict[str, Any] = {}
@@ -644,11 +679,540 @@ class Repository:
         return affected
 
     # ==================================================================================
+    # 统一访问 (模块 / 空间 / 函数体 三类实体共用一套导航与历史)
+    # ==================================================================================
+    KINDS: Sequence[str] = ("module", "space", "function")
+
+    def bucket(self, kind: str) -> Dict[str, Any]:
+        """取得某一类实体的存储字典。"""
+        if kind == "space":
+            return self.spaces
+        if kind == "function":
+            return self.functions
+        return self.entries
+
+    def items(
+        self,
+        kind: Any = "all",
+        *,
+        include_deleted: bool = False,
+    ) -> List[Any]:
+        """按类别返回实体列表 (顺序: 模块 → 空间 → 函数体)。
+
+        ``kind`` 既可以是字符串 (``"all"`` / ``"module"`` / ``"space"`` / ``"function"``),
+        也可以是类别序列 —— 后者供 :class:`~codemethod.core.query.QuerySpec` 使用。
+        """
+        if kind in ("all", "", None):
+            kinds: Sequence[str] = self.KINDS
+        elif isinstance(kind, str):
+            kinds = (kind,)
+        else:
+            selected = [k for k in kind if k in self.KINDS]
+            kinds = tuple(selected) if selected else self.KINDS
+
+        out: List[Any] = []
+        for name in kinds:
+            for entity in self.bucket(name).values():
+                if include_deleted or not entity.deleted:
+                    out.append(entity)
+        return out
+
+    def get_item(self, item_id: str) -> Optional[Any]:
+        """跨三类查找 (id 前缀已经能区分, 但这里不依赖前缀)。"""
+        for name in self.KINDS:
+            found = self.bucket(name).get(item_id)
+            if found is not None:
+                return found
+        return None
+
+    def kind_of(self, item_id: str) -> str:
+        """返回实体类别; 不存在时按历史记录推断, 再退化为 ``module``。"""
+        for name in self.KINDS:
+            if item_id in self.bucket(name):
+                return name
+        for rev in reversed(self.history.revisions(item_id)):
+            if rev.kind:
+                return rev.kind
+        return "module"
+
+    def require_any(self, item_id: str) -> Any:
+        entity = self.get_item(item_id)
+        if entity is None:
+            raise RepositoryError(f"对象不存在: {item_id}")
+        return entity
+
+    def _register_entity_tags(self, entity: Any) -> None:
+        self._register_tags(getattr(entity, "tags", ()) or ())
+
+    def _entity_counts(self) -> Dict[str, int]:
+        return {
+            name: sum(1 for e in self.bucket(name).values() if not e.deleted)
+            for name in self.KINDS
+        }
+
+    # ==================================================================================
+    # 独立空间 (Space)
+    # ==================================================================================
+    def create_space(
+        self,
+        name: str,
+        description: str = "",
+        prerequisites: str = "",
+        tags: Iterable[str] = (),
+        *,
+        status: str = "planned",
+        favorite: bool = False,
+        files: Optional[List[ProjectFile]] = None,
+        entry_point: str = "",
+        space_id: Optional[str] = None,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> Space:
+        space = Space(
+            id=space_id or new_id("spc_"),
+            name=name.strip() or "未命名空间",
+            description=description,
+            prerequisites=prerequisites,
+            tags=normalize_tags(tags),
+            files=list(files or []),
+            status=status if status in STATUS_ORDER else "planned",
+            favorite=favorite,
+            entry_point=entry_point,
+        )
+        if space.id in self.spaces:
+            raise RepositoryError(f"空间 id 冲突: {space.id}")
+        self.spaces[space.id] = space
+        self._register_tags(space.tags)
+        self.history.record(
+            space, "create", summary or "新建空间", author or self.author, force=True
+        )
+        self._touch()
+        return space
+
+    def update_space(
+        self,
+        space_id: str,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        prerequisites: Optional[str] = None,
+        tags: Optional[Iterable[str]] = None,
+        status: Optional[str] = None,
+        favorite: Optional[bool] = None,
+        entry_point: Optional[str] = None,
+        files: Optional[List[ProjectFile]] = None,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> Space:
+        space = self.require_space(space_id)
+        before = take_snapshot(space)
+
+        if name is not None and name.strip():
+            space.name = name.strip()
+        if description is not None:
+            space.description = description
+        if prerequisites is not None:
+            space.prerequisites = prerequisites
+        if tags is not None:
+            space.tags = normalize_tags(tags)
+            self._register_tags(space.tags)
+        if status is not None:
+            if status not in STATUS_ORDER:
+                raise RepositoryError(f"未知状态: {status}")
+            space.status = status
+        if favorite is not None:
+            space.favorite = bool(favorite)
+        if entry_point is not None:
+            space.entry_point = normalize_project_path(entry_point)
+        if files is not None:
+            space.files = list(files)
+
+        after = take_snapshot(space)
+        if checksum_of(before) == checksum_of(after):
+            return space
+        space.touch()
+        after = take_snapshot(space)
+        self.history.record(
+            space, "update", summary or summarize_changes(before, after), author or self.author
+        )
+        self._touch()
+        return space
+
+    def require_space(self, space_id: str) -> Space:
+        space = self.spaces.get(space_id)
+        if space is None:
+            raise RepositoryError(f"空间不存在: {space_id}")
+        return space
+
+    def delete_space(self, space_id: str, *, hard: bool = False, author: Optional[str] = None) -> None:
+        space = self.require_space(space_id)
+        if hard:
+            space.deleted = True
+            space.touch()
+            self.history.record(space, "purge", "彻底删除空间", author or self.author, force=True)
+            self.spaces.pop(space_id, None)
+            self._touch()
+            return
+        if space.deleted:
+            return
+        space.deleted = True
+        space.touch()
+        self.history.record(space, "delete", "移入回收站", author or self.author, force=True)
+        self._touch()
+
+    def restore_space(self, space_id: str, *, author: Optional[str] = None) -> Space:
+        space = self.require_space(space_id)
+        if not space.deleted:
+            return space
+        space.deleted = False
+        space.touch()
+        self.history.record(
+            space, "restore_delete", "从回收站恢复", author or self.author, force=True
+        )
+        self._touch()
+        return space
+
+    # ---- 空间内的文件 ----
+    def _space_file_change(
+        self,
+        space: Space,
+        action: str,
+        summary: str,
+        *,
+        author: Optional[str] = None,
+    ) -> Space:
+        space.touch()
+        self.history.record(space, action, summary, author or self.author, force=True)
+        self._touch()
+        return space
+
+    def put_space_file(
+        self,
+        space_id: str,
+        path: str,
+        content: str = "",
+        *,
+        note: str = "",
+        binary: bool = False,
+        size: int = 0,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> ProjectFile:
+        """新增或覆盖空间里的一个文件。
+
+        文本内容超过 :data:`MAX_FILE_BYTES` 会被拒绝; 二进制文件只记录大小。
+        """
+        space = self.require_space(space_id)
+        normalized = normalize_project_path(path)
+        if not normalized:
+            raise RepositoryError("文件路径不能为空")
+
+        is_binary = binary or is_binary_path(normalized)
+        if is_binary:
+            file = ProjectFile(
+                path=normalized, content="", binary=True, size=max(0, int(size)), note=note
+            )
+        else:
+            if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+                raise RepositoryError(
+                    f"文件过大 ({len(content.encode('utf-8'))} 字节), 上限 {MAX_FILE_BYTES} 字节"
+                )
+            file = ProjectFile(path=normalized, content=content, note=note)
+
+        existing = space.get_file(normalized)
+        if existing is None and len(space.files) >= MAX_FILES_PER_SPACE:
+            raise RepositoryError(f"单个空间的文件数上限为 {MAX_FILES_PER_SPACE}")
+
+        old_size = existing.computed_size if existing is not None else 0
+        space.put_file(file)
+        action = "file_add" if existing is None else "file_update"
+        detail = summary or (
+            f"{'新增' if existing is None else '修改'}文件 {normalized}"
+            + ("" if existing is None else f" ({old_size} → {file.computed_size} 字节)")
+        )
+        self._space_file_change(space, action, detail, author=author)
+        return file
+
+    def rename_space_file(
+        self,
+        space_id: str,
+        old_path: str,
+        new_path: str,
+        *,
+        author: Optional[str] = None,
+    ) -> ProjectFile:
+        space = self.require_space(space_id)
+        source = normalize_project_path(old_path)
+        target = normalize_project_path(new_path)
+        if not target:
+            raise RepositoryError("新路径不能为空")
+        file = space.get_file(source)
+        if file is None:
+            raise RepositoryError(f"文件不存在: {source}")
+        if space.has_path(target):
+            raise RepositoryError(f"目标路径已存在: {target}")
+
+        space.remove_file(source)
+        file.path = target
+        if not file.binary:
+            file.language = ProjectFile(path=target).language
+        file.touch()
+        space.put_file(file)
+        self._space_file_change(
+            space, "file_rename", f"重命名 {source} → {target}", author=author
+        )
+        return file
+
+    def delete_space_file(
+        self, space_id: str, path: str, *, author: Optional[str] = None
+    ) -> bool:
+        space = self.require_space(space_id)
+        normalized = normalize_project_path(path)
+        if not space.remove_file(normalized):
+            return False
+        self._space_file_change(space, "file_delete", f"删除文件 {normalized}", author=author)
+        return True
+
+    def delete_space_directory(
+        self, space_id: str, path: str, *, author: Optional[str] = None
+    ) -> int:
+        space = self.require_space(space_id)
+        normalized = normalize_project_path(path)
+        removed = space.remove_directory(normalized)
+        if removed:
+            self._space_file_change(
+                space, "file_delete", f"删除目录 {normalized}/ (共 {removed} 个文件)", author=author
+            )
+        return removed
+
+    def import_space_files(
+        self,
+        space_id: str,
+        files: Iterable[Tuple[str, str]],
+        *,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> int:
+        """批量导入 ``(相对路径, 文本内容)``, 只产生**一条**修订。"""
+        space = self.require_space(space_id)
+        count = 0
+        for path, content in files:
+            normalized = normalize_project_path(path)
+            if not normalized or is_binary_path(normalized):
+                continue
+            try:
+                space.put_file(ProjectFile(path=normalized, content=str(content)))
+                count += 1
+            except Exception:  # pragma: no cover - 单条失败不影响其余
+                continue
+        if count:
+            self._space_file_change(
+                space, "file_add", summary or f"批量导入 {count} 个文件", author=author
+            )
+        return count
+
+    def space_readme_hits(self, query: str, *, context_lines: int = 2) -> List[Any]:
+        """在全部空间的 README 里检索。"""
+        return search_readmes(self.spaces.values(), query, context_lines=context_lines)
+
+    # ==================================================================================
+    # 函数体 (Function)
+    # ==================================================================================
+    def create_function(
+        self,
+        name: str,
+        language: str = DEFAULT_LANGUAGE,
+        code: str = "",
+        *,
+        signature: str = "",
+        description: str = "",
+        prerequisites: str = "",
+        symbols: Optional[List[Symbol]] = None,
+        tags: Iterable[str] = (),
+        status: str = "planned",
+        favorite: bool = False,
+        function_id: Optional[str] = None,
+        detect: bool = True,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> Function:
+        function = Function(
+            id=function_id or new_id("fn_"),
+            name=name.strip() or "未命名函数",
+            language=normalize_language(language),
+            signature=signature,
+            code=code,
+            description=description,
+            prerequisites=prerequisites,
+            symbols=list(symbols or []),
+            tags=normalize_tags(tags),
+            status=status if status in STATUS_ORDER else "planned",
+            favorite=favorite,
+        )
+        if function.id in self.functions:
+            raise RepositoryError(f"函数体 id 冲突: {function.id}")
+        if detect and not function.symbols:
+            detect_function_symbols(function)
+        self.functions[function.id] = function
+        self._register_tags(function.tags)
+        detail = summary or (
+            f"新建函数体; 检测到 {len(function.symbols)} 个变量"
+            if function.symbols
+            else "新建函数体"
+        )
+        self.history.record(function, "create", detail, author or self.author, force=True)
+        self._touch()
+        return function
+
+    def update_function(
+        self,
+        function_id: str,
+        *,
+        name: Optional[str] = None,
+        language: Optional[str] = None,
+        code: Optional[str] = None,
+        signature: Optional[str] = None,
+        description: Optional[str] = None,
+        prerequisites: Optional[str] = None,
+        symbols: Optional[List[Symbol]] = None,
+        tags: Optional[Iterable[str]] = None,
+        status: Optional[str] = None,
+        favorite: Optional[bool] = None,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> Function:
+        """一次性应用函数体的全部改动, 只产生一条修订。"""
+        function = self.require_function(function_id)
+        before = take_snapshot(function)
+
+        if name is not None and name.strip():
+            function.name = name.strip()
+        if language is not None:
+            function.language = normalize_language(language)
+        if code is not None:
+            function.code = code
+        if signature is not None:
+            function.signature = signature
+        if description is not None:
+            function.description = description
+        if prerequisites is not None:
+            function.prerequisites = prerequisites
+        if symbols is not None:
+            function.set_symbols(symbols)
+        if tags is not None:
+            function.tags = normalize_tags(tags)
+            self._register_tags(function.tags)
+        if status is not None:
+            if status not in STATUS_ORDER:
+                raise RepositoryError(f"未知状态: {status}")
+            function.status = status
+        if favorite is not None:
+            function.favorite = bool(favorite)
+
+        after = take_snapshot(function)
+        if checksum_of(before) == checksum_of(after):
+            return function
+        function.touch()
+        after = take_snapshot(function)
+        self.history.record(
+            function,
+            "update",
+            summary or summarize_changes(before, after),
+            author or self.author,
+        )
+        self._touch()
+        return function
+
+    def require_function(self, function_id: str) -> Function:
+        function = self.functions.get(function_id)
+        if function is None:
+            raise RepositoryError(f"函数体不存在: {function_id}")
+        return function
+
+    def detect_function_symbols(
+        self,
+        function_id: str,
+        *,
+        author: Optional[str] = None,
+        record: bool = True,
+    ) -> Tuple[int, Function]:
+        """重新检测变量并并入符号表, 返回 ``(新增数量, 函数体)``。
+
+        **用户已经填写的含义永远不会被覆盖** —— 见 :meth:`Function.apply_detected`。
+        """
+        function = self.require_function(function_id)
+        before = take_snapshot(function)
+        added = detect_function_symbols(function)
+        after = take_snapshot(function)
+        if record and checksum_of(before) != checksum_of(after):
+            function.touch()
+            after = take_snapshot(function)
+            self.history.record(
+                function,
+                "symbols_detect",
+                f"自动检测变量: 新增 {added} 个; " + summarize_changes(before, after),
+                author or self.author,
+                force=True,
+            )
+            self._touch()
+        return added, function
+
+    def set_function_symbols(
+        self,
+        function_id: str,
+        symbols: List[Symbol],
+        *,
+        author: Optional[str] = None,
+        summary: str = "",
+    ) -> Function:
+        """整体替换变量含义表 (保存函数体时使用)。"""
+        return self.update_function(
+            function_id, symbols=symbols, author=author, summary=summary
+        )
+
+    def delete_function(
+        self, function_id: str, *, hard: bool = False, author: Optional[str] = None
+    ) -> None:
+        function = self.require_function(function_id)
+        if hard:
+            function.deleted = True
+            function.touch()
+            self.history.record(
+                function, "purge", "彻底删除函数体", author or self.author, force=True
+            )
+            self.functions.pop(function_id, None)
+            self._touch()
+            return
+        if function.deleted:
+            return
+        function.deleted = True
+        function.touch()
+        self.history.record(function, "delete", "移入回收站", author or self.author, force=True)
+        self._touch()
+
+    def restore_function(self, function_id: str, *, author: Optional[str] = None) -> Function:
+        function = self.require_function(function_id)
+        if not function.deleted:
+            return function
+        function.deleted = False
+        function.touch()
+        self.history.record(
+            function, "restore_delete", "从回收站恢复", author or self.author, force=True
+        )
+        self._touch()
+        return function
+
+    # ==================================================================================
     # 历史 / 回滚
     # ==================================================================================
-    def revisions(self, entry_id: str, *, descending: bool = True) -> List[Revision]:
-        self.require(entry_id)
-        return self.history.revisions_desc(entry_id) if descending else self.history.revisions(entry_id)
+    def revisions(self, item_id: str, *, descending: bool = True) -> List[Revision]:
+        """返回某个对象的修订列表。
+
+        刻意**不校验对象是否存在**: 彻底删除后历史仍然要能查看 (回收站/审计)。
+        """
+        if descending:
+            return self.history.revisions_desc(item_id)
+        return self.history.revisions(item_id)
 
     def revision_diff(self, revision_id: str, *, context: int = 3) -> str:
         rev = self.history.revision(revision_id)
@@ -664,59 +1228,68 @@ class Repository:
     ) -> str:
         return build_revision_diff(before, after, context=context)
 
-    def _apply_snapshot(self, entry_id: str, snapshot: Dict[str, Any]) -> Entry:
-        entry = Entry.from_dict(copy.deepcopy(snapshot))
-        entry.id = entry_id
-        self.entries[entry_id] = entry
-        self._register_tags(entry.tags)
-        self._invalidate(entry)
+    def _apply_snapshot(
+        self, item_id: str, snapshot: Dict[str, Any], kind: Optional[str] = None
+    ) -> Any:
+        """按快照重建实体并放回对应的集合。"""
+        resolved = kind or kind_of_snapshot(snapshot)
+        data = copy.deepcopy(snapshot)
+        data["id"] = item_id
+        if resolved == "space":
+            entity: Any = Space.from_dict(data)
+        elif resolved == "function":
+            entity = Function.from_dict(data)
+        else:
+            entity = Entry.from_dict(data)
+        self.bucket(resolved)[item_id] = entity
+        self._register_entity_tags(entity)
+        self._invalidate(entity)
         self._touch()
-        return entry
+        return entity
 
     def restore_revision(
-        self, entry_id: str, revision_id: str, *, author: Optional[str] = None
-    ) -> Entry:
-        """把条目**全量**恢复到某个历史版本, 并追加一条 ``restore`` 修订。
+        self, item_id: str, revision_id: str, *, author: Optional[str] = None
+    ) -> Any:
+        """把实体**全量**恢复到某个历史版本, 并追加一条 ``restore`` 修订。
 
         历史本身不会被截断, 因此恢复操作同样可以再被恢复。
         """
-        self.require(entry_id)
+        entity = self.require_any(item_id)
         rev = self.history.revision(revision_id)
         if rev is None:
             raise RepositoryError(f"修订不存在: {revision_id}")
-        if rev.entry_id != entry_id:
-            raise RepositoryError("修订不属于该条目")
+        if rev.entry_id != item_id:
+            raise RepositoryError("修订不属于该对象")
 
-        current = take_snapshot(self.require(entry_id))
-        entry = self._apply_snapshot(entry_id, rev.snapshot)
+        kind = rev.kind or self.kind_of(item_id)
+        current = take_snapshot(entity)
+        restored = self._apply_snapshot(item_id, rev.snapshot, kind)
         self.history.record(
-            entry,
+            restored,
             "restore",
             f"回滚到 {rev.time_label} 的版本 ({rev.action_label}); "
             + summarize_changes(current, rev.snapshot),
             author or self.author,
             force=True,
         )
-        self.history.set_cursor(entry_id, len(self.history.revisions(entry_id)) - 1)
-        return self.entries[entry_id]
+        self.history.set_cursor(item_id, len(self.history.revisions(item_id)) - 1)
+        return restored
 
-    def undo(self, entry_id: str, *, author: Optional[str] = None) -> Optional[Entry]:
+    def undo(self, item_id: str, *, author: Optional[str] = None) -> Optional[Any]:
         """撤销: 游标前移一位并应用其快照 (不追加新修订)。"""
-        self.require(entry_id)
-        target = self.history.step(entry_id, -1)
+        self.require_any(item_id)
+        target = self.history.step(item_id, -1)
         if target is None:
             return None
-        self._apply_snapshot(entry_id, target.snapshot)
-        return self.entries[entry_id]
+        return self._apply_snapshot(item_id, target.snapshot, target.kind)
 
-    def redo(self, entry_id: str, *, author: Optional[str] = None) -> Optional[Entry]:
+    def redo(self, item_id: str, *, author: Optional[str] = None) -> Optional[Any]:
         """重做: 游标后移一位并应用其快照 (不追加新修订)。"""
-        self.require(entry_id)
-        target = self.history.step(entry_id, 1)
+        self.require_any(item_id)
+        target = self.history.step(item_id, 1)
         if target is None:
             return None
-        self._apply_snapshot(entry_id, target.snapshot)
-        return self.entries[entry_id]
+        return self._apply_snapshot(item_id, target.snapshot, target.kind)
 
     def can_undo(self, entry_id: str) -> bool:
         return self.history.can_undo(entry_id)
@@ -746,12 +1319,12 @@ class Repository:
                 out.append((entry, impl))
         return out
 
-    def search_text(self, entry: Entry) -> str:
-        key = (entry.id, entry.version, entry.deleted)
+    def search_text(self, entity: Any) -> str:
+        key = (entity.id, entity.version, entity.deleted)
         cached = self._search_cache.get(key)
         if cached is None:
-            cached = entry.search_blob
-            self._search_cache = {k: v for k, v in self._search_cache.items() if k[0] != entry.id}
+            cached = entity.search_blob
+            self._search_cache = {k: v for k, v in self._search_cache.items() if k[0] != entity.id}
             self._search_cache[key] = cached
         return cached
 
@@ -761,10 +1334,37 @@ class Repository:
             counts[impl.language] = counts.get(impl.language, 0) + 1
         return counts
 
+    def space_language_bytes(self) -> Dict[str, int]:
+        """汇总全部空间的代码字节数 (GitHub 风格占比的数据来源)。"""
+        totals: Dict[str, int] = {}
+        for space in self.spaces.values():
+            if space.deleted:
+                continue
+            for share in space.language_shares():
+                totals[share.language] = totals.get(share.language, 0) + share.bytes
+        return totals
+
+    def overall_language_shares(self) -> List[Any]:
+        """整个代码库的语言占比 (按空间里的代码字节数统计)。"""
+        from .spaces import LanguageShare
+
+        totals = self.space_language_bytes()
+        grand = sum(totals.values())
+        shares = []
+        for language, size in totals.items():
+            share = LanguageShare(language=language, bytes=size, files=0, lines=0)
+            share.percent = (size / grand * 100.0) if grand else 0.0
+            shares.append(share)
+        shares.sort(key=lambda s: (-s.bytes, s.name))
+        return shares
+
     def statistics(self) -> Dict[str, Any]:
         entries = self.entries_list()
         deleted = [e for e in self.entries.values() if e.deleted]
         impls = [impl for e in entries for impl in e.active_implementations]
+        spaces = [s for s in self.spaces.values() if not s.deleted]
+        functions = [f for f in self.functions.values() if not f.deleted]
+        counts = self._entity_counts()
         return {
             "name": self.name,
             "entries": len(entries),
@@ -775,6 +1375,17 @@ class Repository:
             "revisions": self.history.total_count(),
             "code_lines": sum(impl.line_count for impl in impls),
             "code_chars": sum(len(impl.code) for impl in impls),
+            # 三类实体
+            "modules": counts.get("module", 0),
+            "spaces": counts.get("space", 0),
+            "functions": counts.get("function", 0),
+            "space_files": sum(len(s.files) for s in spaces),
+            "space_bytes": sum(s.total_size for s in spaces),
+            "space_readmes": sum(len(s.readme_files) for s in spaces),
+            "function_symbols": sum(len(f.symbols) for f in functions),
+            "symbols_missing_meaning": sum(
+                len(f.symbols_missing_meaning) for f in functions
+            ),
             "created_at": self.created_at,
             "modified_at": self.modified_at,
         }
@@ -782,8 +1393,8 @@ class Repository:
     # ==================================================================================
     # 内部
     # ==================================================================================
-    def _invalidate(self, entry: Entry) -> None:
-        self._search_cache = {k: v for k, v in self._search_cache.items() if k[0] != entry.id}
+    def _invalidate(self, entity: Any) -> None:
+        self._search_cache = {k: v for k, v in self._search_cache.items() if k[0] != entity.id}
 
     def _touch(self) -> None:
         self.modified_at = utcnow()
@@ -805,6 +1416,9 @@ class Repository:
             "modified_at": self.modified_at,
             "tags": [info.to_dict() for info in self.tags.values()],
             "entries": [entry.to_dict() for entry in self.entries.values()],
+            # 三类实体同处一个容器: 旧版本读到多余键会忽略, 新版本缺键则当作空
+            "spaces": [space.to_dict() for space in self.spaces.values()],
+            "functions": [func.to_dict() for func in self.functions.values()],
             "extra": dict(self.extra),
         }
         if include_history:
@@ -828,25 +1442,35 @@ class Repository:
                 continue
             entry = Entry.from_dict(item)
             repo.entries[entry.id] = entry
+        for item in data.get("spaces") or []:
+            if not isinstance(item, dict):
+                continue
+            space = Space.from_dict(item)
+            repo.spaces[space.id] = space
+        for item in data.get("functions") or []:
+            if not isinstance(item, dict):
+                continue
+            function = Function.from_dict(item)
+            repo.functions[function.id] = function
         for item in data.get("tags") or []:
             if not isinstance(item, dict):
                 continue
             info = TagInfo.from_dict(item)
             if info.name:
                 repo.tags[info.key] = info
-        # 为没有元数据的标签补齐
+        # 为没有元数据的标签补齐 (三类实体的标签都要收)
         seen: List[str] = []
-        for entry in repo.entries.values():
-            seen.extend(entry.tags)
+        for entity in repo.items(include_deleted=True):
+            seen.extend(getattr(entity, "tags", ()) or ())
         repo._register_tags(seen)
 
         history_data = data.get("history")
         if isinstance(history_data, dict):
             repo.history = HistoryStore.from_dict(history_data)
         else:
-            # 没有历史数据时, 至少为每个条目补一条初始快照
-            for entry in repo.entries.values():
-                repo.history.record(entry, "create", "导入的初始版本", force=True)
+            # 没有历史数据时, 至少为每个对象补一条初始快照
+            for entity in repo.items(include_deleted=True):
+                repo.history.record(entity, "create", "导入的初始版本", force=True)
         repo.dirty = False
         return repo
 
@@ -864,4 +1488,5 @@ __all__ = [
     "DEFAULT_LANGUAGE",
     "build_revision_diff",
     "summarize_changes",
+    "detect_function_symbols",
 ]

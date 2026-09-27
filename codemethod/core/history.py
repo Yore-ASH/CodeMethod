@@ -36,9 +36,12 @@ def checksum_of(snapshot: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(snapshot).encode("utf-8")).hexdigest()
 
 
-def take_snapshot(entry: Entry) -> Dict[str, Any]:
-    """取得条目的全量快照 (不含历史本身)。"""
-    return entry.to_dict(include_implementations=True)
+def take_snapshot(entity: Any) -> Dict[str, Any]:
+    """取得实体的全量快照 (不含历史本身)。
+
+    模块 / 空间 / 函数体都实现了 ``to_dict()``, 因此这里用鸭子类型。
+    """
+    return entity.to_dict()
 
 
 # --------------------------------------------------------------------------------------
@@ -79,6 +82,198 @@ _IMPL_META_FIELDS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+def kind_of_snapshot(snapshot: Optional[Dict[str, Any]]) -> str:
+    """按快照里出现的关键字段判断它属于哪类实体。
+
+    刻意用"看字段"而不是"看标记": 这样旧文件 (没有 kind 字段) 也能正确判断。
+    """
+    if not isinstance(snapshot, dict):
+        return "module"
+    if snapshot.get("implementations") is not None or "implementations" in snapshot:
+        return "module"
+    if "files" in snapshot:
+        return "space"
+    if "symbols" in snapshot:
+        return "function"
+    return "module"
+
+
+def _common_fields_diff(
+    chunks: List[str],
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    *,
+    title_field: str,
+    title_label: str,
+    context: int,
+) -> None:
+    """标题/名称、描述、前置要求、状态、标签、收藏 这些三类实体共有的字段。"""
+    fields = (
+        (title_field, title_label),
+        ("description", "描述"),
+        ("prerequisites", "前置要求"),
+        ("status", "状态"),
+    )
+    for field_name, label in fields:
+        old = str(before.get(field_name) or "")
+        new = str(after.get(field_name) or "")
+        if old == new:
+            continue
+        diff = _unified_diff(old, new, label, context)
+        if diff:
+            chunks.append(f"### {label}")
+            chunks.extend(diff)
+            chunks.append("")
+
+    added, removed = diff_tag_sets(before.get("tags") or [], after.get("tags") or [])
+    if added or removed:
+        chunks.append("### 标签")
+        for tag in removed:
+            chunks.append(f"-{tag}")
+        for tag in added:
+            chunks.append(f"+{tag}")
+        chunks.append("")
+
+    if bool(before.get("favorite")) != bool(after.get("favorite")):
+        chunks.append("### 收藏")
+        chunks.append(f"-{'收藏' if before.get('favorite') else '未收藏'}")
+        chunks.append(f"+{'收藏' if after.get('favorite') else '未收藏'}")
+        chunks.append("")
+
+
+def _space_diff(
+    before: Dict[str, Any], after: Dict[str, Any], context: int
+) -> List[str]:
+    """空间的差异: 共有字段 + 文件的增删改。"""
+    chunks: List[str] = []
+    _common_fields_diff(
+        chunks, before, after, title_field="name", title_label="空间名称", context=context
+    )
+
+    old_files = {f.get("path"): f for f in (before.get("files") or []) if isinstance(f, dict)}
+    new_files = {f.get("path"): f for f in (after.get("files") or []) if isinstance(f, dict)}
+
+    for path in sorted(set(old_files) - set(new_files)):
+        item = old_files[path]
+        chunks.append(f"### 删除文件 · {path}")
+        if not item.get("binary"):
+            body = (item.get("content") or "").splitlines() or ["<空文件>"]
+            chunks.extend(f"-{line}" for line in body[:80])
+        else:
+            chunks.append(f"-（二进制, {item.get('size', 0)} 字节）")
+        chunks.append("")
+
+    for path in sorted(set(new_files) - set(old_files)):
+        item = new_files[path]
+        chunks.append(f"### 新增文件 · {path} ({item.get('language')})")
+        if not item.get("binary"):
+            body = (item.get("content") or "").splitlines() or ["<空文件>"]
+            chunks.extend(f"+{line}" for line in body[:80])
+        else:
+            chunks.append(f"+（二进制, {item.get('size', 0)} 字节）")
+        chunks.append("")
+
+    for path in sorted(set(old_files) & set(new_files)):
+        old_item, new_item = old_files[path], new_files[path]
+        if str(old_item.get("note") or "") != str(new_item.get("note") or ""):
+            chunks.append(f"### {path} · 说明")
+            chunks.append(f"-{old_item.get('note') or '<空>'}")
+            chunks.append(f"+{new_item.get('note') or '<空>'}")
+            chunks.append("")
+        if bool(old_item.get("binary")) != bool(new_item.get("binary")):
+            chunks.append(f"### {path} · 二进制标记变更")
+            chunks.append(f"-binary={bool(old_item.get('binary'))}")
+            chunks.append(f"+binary={bool(new_item.get('binary'))}")
+            chunks.append("")
+            continue
+        old_language, new_language = old_item.get("language"), new_item.get("language")
+        if old_language != new_language:
+            chunks.append(f"### {path} · 语言")
+            chunks.append(f"-{old_language}")
+            chunks.append(f"+{new_language}")
+            chunks.append("")
+        if old_item.get("binary"):
+            continue
+        content_diff = _unified_diff(
+            str(old_item.get("content") or ""), str(new_item.get("content") or ""), path, context
+        )
+        if content_diff:
+            chunks.append(f"### 文件内容 · {path}")
+            chunks.extend(content_diff)
+            chunks.append("")
+
+    if len(old_files) != len(new_files):
+        chunks.append(f"（文件数量: {len(old_files)} → {len(new_files)}）")
+    return chunks
+
+
+def _function_diff(
+    before: Dict[str, Any], after: Dict[str, Any], context: int
+) -> List[str]:
+    """函数体的差异: 共有字段 + 代码 + **变量含义表**的变化。"""
+    chunks: List[str] = []
+    _common_fields_diff(
+        chunks, before, after, title_field="name", title_label="函数名", context=context
+    )
+
+    for field_name, label in (("language", "语言"), ("signature", "函数签名")):
+        old = str(before.get(field_name) or "")
+        new = str(after.get(field_name) or "")
+        if old == new:
+            continue
+        chunks.append(f"### {label}")
+        chunks.append(f"-{old or '<空>'}")
+        chunks.append(f"+{new or '<空>'}")
+        chunks.append("")
+
+    # 变量表: 新增 / 删除 / 含义被填写或修改
+    def index(snapshot: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
+        return {
+            (s.get("kind"), s.get("name")): s
+            for s in (snapshot.get("symbols") or [])
+            if isinstance(s, dict)
+        }
+
+    old_symbols, new_symbols = index(before), index(after)
+    for key in sorted(set(new_symbols) - set(old_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+        symbol = new_symbols[key]
+        chunks.append(f"### 新增变量 · {symbol.get('name')} ({symbol.get('kind')})")
+        if symbol.get("type"):
+            chunks.append(f"+类型: {symbol.get('type')}")
+        if symbol.get("meaning"):
+            chunks.append(f"+含义: {symbol.get('meaning')}")
+        chunks.append("")
+
+    for key in sorted(set(old_symbols) - set(new_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+        symbol = old_symbols[key]
+        chunks.append(f"### 删除变量 · {symbol.get('name')} ({symbol.get('kind')})")
+        if symbol.get("meaning"):
+            chunks.append(f"-含义: {symbol.get('meaning')}")
+        chunks.append("")
+
+    for key in sorted(set(old_symbols) & set(new_symbols), key=lambda k: (str(k[0]), str(k[1]))):
+        old_symbol, new_symbol = old_symbols[key], new_symbols[key]
+        for field_name, label in (("type", "类型"), ("meaning", "含义")):
+            old_val = str(old_symbol.get(field_name) or "")
+            new_val = str(new_symbol.get(field_name) or "")
+            if old_val == new_val:
+                continue
+            chunks.append(f"### 变量 {new_symbol.get('name')} · {label}")
+            chunks.append(f"-{old_val or '<空>'}")
+            chunks.append(f"+{new_val or '<空>'}")
+            chunks.append("")
+
+    code_diff = _unified_diff(
+        str(before.get("code") or ""), str(after.get("code") or ""), "函数体", context
+    )
+    if code_diff:
+        chunks.append("### 代码")
+        chunks.extend(code_diff)
+        chunks.append("")
+
+    return chunks
+
+
 def build_revision_diff(
     before: Optional[Dict[str, Any]],
     after: Optional[Dict[str, Any]],
@@ -88,16 +283,28 @@ def build_revision_diff(
     """生成可直接显示的统一差异文本。
 
     ``before`` 为 ``None`` 表示"新增"; ``after`` 为 ``None`` 表示"删除"。
+    自动识别模块 / 空间 / 函数体三种快照形态。
     """
     chunks: List[str] = []
     if before is None and after is None:
         return ""
+
+    kind = kind_of_snapshot(after if after is not None else before)
+    entity = {"space": "空间", "function": "函数体"}.get(kind, "条目")
+
     if before is None:
-        chunks.append("+++ 新增条目 +++")
+        chunks.append(f"+++ 新增{entity} +++")
         before = {}
     if after is None:
-        chunks.append("--- 删除条目 ---")
+        chunks.append(f"--- 删除{entity} ---")
         after = {}
+
+    if kind == "space":
+        chunks.extend(_space_diff(before, after, context))
+        return "\n".join(chunks).strip()
+    if kind == "function":
+        chunks.extend(_function_diff(before, after, context))
+        return "\n".join(chunks).strip()
 
     for field_name, label in _TEXT_FIELDS:
         old = str(before.get(field_name) or "")
@@ -174,12 +381,104 @@ def build_revision_diff(
     return "\n".join(chunks).strip()
 
 
+def _count_line_changes(old_code: str, new_code: str) -> Tuple[int, int]:
+    """返回 ``(+新增行, -删除行)``。"""
+    added_n = removed_n = 0
+    for line in difflib.unified_diff(
+        old_code.splitlines(), new_code.splitlines(), lineterm="", n=0
+    ):
+        if line.startswith("+") and not line.startswith("+++"):
+            added_n += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed_n += 1
+    return added_n, removed_n
+
+
+def _summarize_space(before: Dict[str, Any], after: Dict[str, Any]) -> str:
+    bits: List[str] = []
+    for field_name, label in (("name", "空间名称"), ("description", "描述"),
+                              ("prerequisites", "前置要求"), ("status", "状态")):
+        if str(before.get(field_name) or "") != str(after.get(field_name) or ""):
+            bits.append(label)
+
+    added, removed = diff_tag_sets(before.get("tags") or [], after.get("tags") or [])
+    if added or removed:
+        parts = [f"+{len(added)}"] if added else []
+        if removed:
+            parts.append(f"-{len(removed)}")
+        bits.append("标签 " + "/".join(parts))
+
+    old_files = {f.get("path"): f for f in (before.get("files") or []) if isinstance(f, dict)}
+    new_files = {f.get("path"): f for f in (after.get("files") or []) if isinstance(f, dict)}
+    for path in sorted(set(new_files) - set(old_files)):
+        bits.append(f"新增文件 {path}")
+    for path in sorted(set(old_files) - set(new_files)):
+        bits.append(f"删除文件 {path}")
+    for path in sorted(set(old_files) & set(new_files)):
+        old_item, new_item = old_files[path], new_files[path]
+        if bool(old_item.get("binary")) or bool(new_item.get("binary")):
+            continue
+        if str(old_item.get("content") or "") != str(new_item.get("content") or ""):
+            plus, minus = _count_line_changes(
+                str(old_item.get("content") or ""), str(new_item.get("content") or "")
+            )
+            bits.append(f"{path} +{plus}/-{minus}")
+    return ", ".join(bits) if bits else "无实质变更"
+
+
+def _summarize_function(before: Dict[str, Any], after: Dict[str, Any]) -> str:
+    bits: List[str] = []
+    for field_name, label in (("name", "函数名"), ("description", "描述"),
+                              ("prerequisites", "前置要求"), ("language", "语言"),
+                              ("signature", "签名"), ("status", "状态")):
+        if str(before.get(field_name) or "") != str(after.get(field_name) or ""):
+            bits.append(label)
+
+    added, removed = diff_tag_sets(before.get("tags") or [], after.get("tags") or [])
+    if added or removed:
+        parts = [f"+{len(added)}"] if added else []
+        if removed:
+            parts.append(f"-{len(removed)}")
+        bits.append("标签 " + "/".join(parts))
+
+    def index(snapshot: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
+        return {(s.get("kind"), s.get("name")): s for s in (snapshot.get("symbols") or [])
+                if isinstance(s, dict)}
+
+    old_symbols, new_symbols = index(before), index(after)
+    if new_symbols.keys() - old_symbols.keys():
+        bits.append(f"新增变量 {len(new_symbols.keys() - old_symbols.keys())}")
+    if old_symbols.keys() - new_symbols.keys():
+        bits.append(f"删除变量 {len(old_symbols.keys() - new_symbols.keys())}")
+    filled = 0
+    for key in old_symbols.keys() & new_symbols.keys():
+        old_meaning = str(old_symbols[key].get("meaning") or "")
+        new_meaning = str(new_symbols[key].get("meaning") or "")
+        if old_meaning != new_meaning:
+            filled += 1
+    if filled:
+        bits.append(f"{filled} 个变量含义变更")
+
+    old_code = str(before.get("code") or "")
+    new_code = str(after.get("code") or "")
+    if old_code != new_code:
+        plus, minus = _count_line_changes(old_code, new_code)
+        bits.append(f"代码 +{plus}/-{minus}")
+    return ", ".join(bits) if bits else "无实质变更"
+
+
 def summarize_changes(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> str:
     """生成一句话变更摘要, 形如 ``标题, 描述, Python 代码 +12/-3, 标签 +2``。"""
     if before is None:
         return "新建条目"
     if after is None:
         return "删除条目"
+
+    kind = kind_of_snapshot(after if after else before)
+    if kind == "space":
+        return _summarize_space(before, after)
+    if kind == "function":
+        return _summarize_function(before, after)
 
     bits: List[str] = []
     for field_name, label in _TEXT_FIELDS:
@@ -253,7 +552,7 @@ class HistoryStore:
     # ---- 记录 ----
     def record(
         self,
-        entry: Entry,
+        entry: Any,
         action: str = "update",
         summary: str = "",
         author: str = "local",
@@ -261,7 +560,7 @@ class HistoryStore:
         snapshot: Optional[Dict[str, Any]] = None,
         force: bool = False,
     ) -> Optional[Revision]:
-        """为 ``entry`` 追加一条修订。
+        """为 ``entry`` 追加一条修订 (模块 / 空间 / 函数体皆可)。
 
         若新快照与当前最后一条完全相同且 ``force=False``, 则跳过, 返回 ``None``。
         """
@@ -291,6 +590,7 @@ class HistoryStore:
             timestamp=utcnow(),
             parent_id=parent,
             checksum=digest,
+            kind=str(getattr(entry, "kind", "module")),
         )
         timeline.append(rev)
         self._index[rev.id] = rev

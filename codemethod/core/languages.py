@@ -46,6 +46,10 @@ class LanguageSpec:
     # --- 展示 ---
     monaco_id: str = ""
     color: str = "#4EC9B0"
+    # 语言类别: code / markup / data / prose。
+    # 用于"语言占比"统计 —— 与 GitHub linguist 一样, 占比条只算真正的代码,
+    # 文档与配置文件仍会列出但不参与百分比。
+    category: str = "code"
     extra_keywords: Tuple[str, ...] = field(default=(), repr=False)
 
     # ---- 便捷访问 ----
@@ -432,6 +436,7 @@ _SQL = LanguageSpec(
     case_sensitive=False,
     monaco_id="sql",
     color="#E38C00",
+    category="data",
 )
 
 _BASH = LanguageSpec(
@@ -474,6 +479,7 @@ _JSON = LanguageSpec(
     function_call_highlight=False,
     monaco_id="json",
     color="#CBCB41",
+    category="data",
 )
 
 _YAML = LanguageSpec(
@@ -493,6 +499,7 @@ _YAML = LanguageSpec(
     function_call_highlight=False,
     monaco_id="yaml",
     color="#CB171E",
+    category="data",
 )
 
 _HTML = LanguageSpec(
@@ -514,6 +521,7 @@ _HTML = LanguageSpec(
     function_call_highlight=False,
     monaco_id="html",
     color="#E34C26",
+    category="markup",
 )
 
 _CSS = LanguageSpec(
@@ -535,6 +543,7 @@ _CSS = LanguageSpec(
     variable_prefix="$",
     monaco_id="css",
     color="#563D7C",
+    category="markup",
 )
 
 _MARKDOWN = LanguageSpec(
@@ -552,6 +561,7 @@ _MARKDOWN = LanguageSpec(
     function_call_highlight=False,
     monaco_id="markdown",
     color="#083FA1",
+    category="prose",
 )
 
 _KOTLIN = LanguageSpec(
@@ -677,6 +687,7 @@ _PLAINTEXT = LanguageSpec(
     function_call_highlight=False,
     monaco_id="plaintext",
     color="#9E9E9E",
+    category="prose",
 )
 
 

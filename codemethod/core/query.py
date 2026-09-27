@@ -41,8 +41,10 @@ SORT_OPTIONS: Sequence[tuple] = (
     ("created_asc", "最早创建"),
     ("title_asc", "标题 A→Z"),
     ("title_desc", "标题 Z→A"),
+    ("kind", "按类别 (模块→空间→函数体)"),
     ("status", "按规划状态"),
     ("lines_desc", "代码行数"),
+    ("size_desc", "体积/文件数"),
     ("revisions_desc", "修订次数"),
     ("tags_desc", "标签数量"),
 )
@@ -59,6 +61,8 @@ class QuerySpec:
     tag_mode: TagMatch = TagMatch.ALL
     languages: List[str] = field(default_factory=list)
     statuses: List[str] = field(default_factory=list)
+    # 类别过滤: 空列表 = 全部 (module / space / function)
+    kinds: List[str] = field(default_factory=list)
     favorites_only: bool = False
     include_deleted: bool = False
     only_deleted: bool = False
@@ -74,6 +78,7 @@ class QuerySpec:
             "tag_mode": self.tag_mode,
             "languages": list(self.languages),
             "statuses": list(self.statuses),
+            "kinds": list(self.kinds),
             "favorites_only": self.favorites_only,
             "include_deleted": self.include_deleted,
             "only_deleted": self.only_deleted,
@@ -97,6 +102,11 @@ class QuerySpec:
 
     def describe(self) -> str:
         bits: List[str] = []
+        if self.kinds:
+            label = {"module": "模块", "space": "空间", "function": "函数体"}
+            bits.append("、".join(label.get(k, k) for k in self.kinds))
+        if self.text.strip():
+            bits.append(f'文本 "{self.text.strip()}"')
         if self.text.strip():
             bits.append(f'文本 "{self.text.strip()}"')
         if self.tags:
@@ -150,16 +160,47 @@ def parse_query_text(text: str) -> List[TextTerm]:
     return terms
 
 
-def full_text_blob(entry: Entry, *, search_code: bool = True, search_description: bool = True) -> str:
+def full_text_blob(
+    item: Any, *, search_code: bool = True, search_description: bool = True
+) -> str:
     """按范围拼出用于子串匹配的文本 (全部小写)。
 
-    标题与标签始终参与匹配; 描述/前置要求与源代码是否参与由调用方决定。
+    模块 / 空间 / 函数体各有自己的内容构成, 因此按类别分别拼装:
+    标题与标签始终参与; 描述与代码是否参与由调用方决定。
     """
-    parts: List[str] = [entry.title, " ".join(entry.tags)]
+    kind = getattr(item, "kind", "module")
+    parts: List[str] = [item.display_title, " ".join(getattr(item, "tags", ()) or ())]
+
+    if kind == "space":
+        if search_description:
+            parts.append(item.description)
+            parts.append(item.prerequisites)
+        for file in item.files:
+            parts.append(file.path)
+            parts.append(file.note)
+            # README 与源码都属于"内容", 是否参与检索由 search_code 控制
+            if search_code and not file.binary:
+                parts.append(file.content)
+        return "\n".join(p for p in parts if p).casefold()
+
+    if kind == "function":
+        if search_description:
+            parts.append(item.description)
+            parts.append(item.prerequisites)
+            parts.append(item.signature)
+            for symbol in item.symbols:
+                parts.append(symbol.name)
+                parts.append(symbol.type)
+                parts.append(symbol.meaning)
+        if search_code:
+            parts.append(item.code)
+        return "\n".join(p for p in parts if p).casefold()
+
+    # 模块
     if search_description:
-        parts.append(entry.description)
-        parts.append(entry.prerequisites)
-    for impl in entry.active_implementations:
+        parts.append(item.description)
+        parts.append(item.prerequisites)
+    for impl in item.active_implementations:
         parts.append(impl.title)
         parts.append(impl.filename)
         parts.append(impl.notes)
@@ -167,58 +208,93 @@ def full_text_blob(entry: Entry, *, search_code: bool = True, search_description
         parts.append(impl.prerequisites)
         if search_code:
             parts.append(impl.code)
-    return "\n".join(parts).casefold()
-
-
-def prerequisites_blob(entry: Entry) -> str:
-    """条目「通用前置要求」+ 各语言前置要求 的合并文本 (小写)。"""
-    parts = [entry.prerequisites]
-    parts.extend(impl.prerequisites for impl in entry.active_implementations)
     return "\n".join(p for p in parts if p).casefold()
+
+
+def prerequisites_blob(item: Any) -> str:
+    """通用前置要求 + 各语言前置要求 的合并文本 (小写)。"""
+    kind = getattr(item, "kind", "module")
+    parts = [getattr(item, "prerequisites", "") or ""]
+    if kind == "module":
+        parts.extend(impl.prerequisites for impl in item.active_implementations)
+    return "\n".join(p for p in parts if p).casefold()
+
+
+def readme_blob(item: Any) -> str:
+    """只包含 README 文件内容的检索文本 (小写); 非空间返回空串。"""
+    if getattr(item, "kind", "") != "space":
+        return ""
+    parts = [file.content for file in item.readme_files]
+    return "\n".join(parts).casefold()
 
 
 def _entry_matches_term(
     repo,
-    entry: Entry,
+    item: Any,
     term: TextTerm,
     *,
     search_code: bool = True,
     search_description: bool = True,
     blob: Optional[str] = None,
 ) -> bool:
-    """判断单个词项是否命中。``field_name`` 决定作用域, 否则做全文匹配。"""
+    """判断单个词项是否命中。``field_name`` 决定作用域, 否则做全文匹配。
+
+    ``item`` 可以是模块 / 空间 / 函数体 —— 只依赖它们共有的属性与小写鸭子类型。
+    """
     value = term.value
     field_name = term.field
     low = value.casefold()
+    kind = getattr(item, "kind", "module")
     hit: bool
 
     if field_name in ("tag", "tags", "label"):
-        hit = any(tag_key(t) == tag_key(value) or low in t.casefold() for t in entry.tags)
+        hit = any(tag_key(t) == tag_key(value) or low in t.casefold() for t in item.tags)
+
+    elif field_name in ("kind", "type", "类别"):
+        aliases = {
+            "module": ("module", "模块", "条目", "entry"),
+            "space": ("space", "空间", "项目", "project"),
+            "function": ("function", "函数", "函数体", "fn"),
+        }
+        hit = low in aliases.get(kind, ())
 
     elif field_name in ("lang", "language"):
         want = normalize_language(value)
-        hit = any(impl.language == want for impl in entry.active_implementations)
+        languages = list(getattr(item, "languages", ()) or ())
+        hit = want in languages
         if not hit:  # 别名/文本兜底, 例如 lang:py3
-            hit = low in " ".join(entry.languages).casefold()
+            hit = low in " ".join(languages).casefold()
 
     elif field_name in ("status", "state"):
-        hit = entry.status == low or entry.status_label.casefold() == low
+        hit = item.status == low or item.status_label.casefold() == low
 
     elif field_name in ("prereq", "prereqs", "requires", "require", "前置"):
-        # 同时搜「通用前置要求」与各语言自己的前置要求
-        hit = low in prerequisites_blob(entry)
+        hit = low in prerequisites_blob(item)
+
+    elif field_name in ("readme", "readme.md", "说明"):
+        # 只在 README 文件里搜 —— 这正是"自动检索库中的 README"的检索入口
+        hit = low in readme_blob(item)
+
+    elif field_name in ("file", "path", "文件"):
+        hit = kind == "space" and any(
+            low in file.path.casefold() for file in getattr(item, "files", ())
+        )
 
     elif field_name in ("is", "flag"):
         if low in ("favorite", "fav", "star", "收藏"):
-            hit = entry.favorite
+            hit = item.favorite
         elif low in ("deleted", "trash", "回收站"):
-            hit = entry.deleted
+            hit = item.deleted
         elif low in ("has_code", "code", "有代码"):
-            hit = bool(entry.active_implementations)
+            hit = bool(getattr(item, "badge_count", 0))
         elif low in ("multi", "multilang", "多语言"):
-            hit = len(entry.languages) > 1
+            hit = len(list(getattr(item, "languages", ()) or ())) > 1
+        elif low in ("readme", "有readme"):
+            hit = bool(getattr(item, "readme_files", ()) or ())
+        elif low in ("unresolved", "missing_meaning", "待填写"):
+            hit = bool(getattr(item, "has_unresolved_symbols", False))
         elif low in ("history", "有历史"):
-            hit = repo.history.count(entry.id) > 1 if repo is not None else entry.version > 1
+            hit = repo.history.count(item.id) > 1 if repo is not None else item.version > 1
         else:
             hit = False
 
@@ -228,7 +304,7 @@ def _entry_matches_term(
         haystack = blob
         if haystack is None:
             haystack = full_text_blob(
-                entry, search_code=search_code, search_description=search_description
+                item, search_code=search_code, search_description=search_description
             )
         hit = needle in haystack
 
@@ -237,7 +313,7 @@ def _entry_matches_term(
 
 def _entry_matches_text(
     repo,
-    entry: Entry,
+    item: Any,
     text: str,
     *,
     search_code: bool = True,
@@ -250,20 +326,23 @@ def _entry_matches_text(
     # 这些字段自带作用域, 不需要拼接全文 blob
     scoped = {
         "tag", "tags", "label",
+        "kind", "type", "类别",
         "lang", "language",
         "status", "state",
         "is", "flag",
         "prereq", "prereqs", "requires", "require", "前置",
+        "readme", "readme.md", "说明",
+        "file", "path", "文件",
     }
     for term in terms:
         needs_blob = term.field not in scoped
         if needs_blob and blob is None:
             blob = full_text_blob(
-                entry, search_code=search_code, search_description=search_description
+                item, search_code=search_code, search_description=search_description
             )
         if not _entry_matches_term(
             repo,
-            entry,
+            item,
             term,
             search_code=search_code,
             search_description=search_description,
@@ -278,27 +357,31 @@ def _entry_matches_text(
 # --------------------------------------------------------------------------------------
 
 
-def entry_matches(repo, entry: Entry, spec: QuerySpec) -> bool:
-    """判断条目是否满足查询条件。"""
+def entry_matches(repo, item: Any, spec: QuerySpec) -> bool:
+    """判断一个对象 (模块 / 空间 / 函数体) 是否满足查询条件。"""
     if spec.only_deleted:
-        if not entry.deleted:
+        if not item.deleted:
             return False
-    elif not spec.include_deleted and entry.deleted:
+    elif not spec.include_deleted and item.deleted:
         return False
 
-    if spec.favorites_only and not entry.favorite:
+    # 类别过滤: 空 = 全部
+    if spec.kinds and getattr(item, "kind", "module") not in spec.kinds:
         return False
 
-    if spec.statuses and entry.status not in spec.statuses:
+    if spec.favorites_only and not item.favorite:
+        return False
+
+    if spec.statuses and item.status not in spec.statuses:
         return False
 
     if spec.languages:
         wanted = {normalize_language(lang) for lang in spec.languages}
-        if not wanted & set(entry.languages):
+        if not wanted & set(getattr(item, "languages", ()) or ()):
             return False
 
     if spec.tags:
-        entry_keys = {tag_key(t) for t in entry.tags}
+        entry_keys = {tag_key(t) for t in item.tags}
         wanted_keys = {tag_key(t) for t in spec.tags}
         if spec.tag_mode is TagMatch.ALL:
             if not wanted_keys.issubset(entry_keys):
@@ -316,7 +399,7 @@ def entry_matches(repo, entry: Entry, spec: QuerySpec) -> bool:
     if spec.text.strip():
         if not _entry_matches_text(
             repo,
-            entry,
+            item,
             spec.text,
             search_code=spec.search_code,
             search_description=spec.search_description,
@@ -326,16 +409,26 @@ def entry_matches(repo, entry: Entry, spec: QuerySpec) -> bool:
     return True
 
 
-def query_entries(repo, spec: QuerySpec) -> List[Entry]:
-    """按条件过滤并排序。"""
-    found = [e for e in repo.entries.values() if entry_matches(repo, e, spec)]
+def query_entries(repo, spec: QuerySpec) -> List[Any]:
+    """按条件过滤并排序 (覆盖模块 / 空间 / 函数体三类)。"""
+    found = [item for item in repo.items(spec.kinds or "all", include_deleted=True)
+             if entry_matches(repo, item, spec)]
     return sort_entries(found, spec.sort_key, repo=repo)
+
+
+# 兼容旧名字
+query_items = query_entries
 
 
 _STATUS_RANK = {name: i for i, name in enumerate(STATUS_ORDER)}
 
 
-def sort_entries(entries: Iterable[Entry], sort_key: str = "updated_desc", *, repo=None) -> List[Entry]:
+_KIND_RANK = {"module": 0, "space": 1, "function": 2}
+
+
+def sort_entries(
+    entries: Iterable[Any], sort_key: str = "updated_desc", *, repo=None
+) -> List[Any]:
     """排序。``repo`` 用于需要历史信息的排序键。"""
     items = list(entries)
     key = sort_key or "updated_desc"
@@ -352,10 +445,22 @@ def sort_entries(entries: Iterable[Entry], sort_key: str = "updated_desc", *, re
         items.sort(key=lambda e: e.display_title.casefold())
     elif key == "title_desc":
         items.sort(key=lambda e: e.display_title.casefold(), reverse=True)
+    elif key == "kind":
+        items.sort(
+            key=lambda e: (
+                _KIND_RANK.get(getattr(e, "kind", "module"), 9),
+                e.display_title.casefold(),
+            )
+        )
     elif key == "status":
         items.sort(key=lambda e: (_STATUS_RANK.get(e.status, 99), -e.updated_at))
     elif key == "lines_desc":
         items.sort(key=lambda e: (-e.total_lines, e.display_title.casefold()))
+    elif key == "size_desc":
+        # 空间按总字节数, 其余按内容规模, 统一成"体积"语义
+        items.sort(
+            key=lambda e: (-(getattr(e, "total_size", 0) or e.badge_count), e.display_title.casefold())
+        )
     elif key == "tags_desc":
         items.sort(key=lambda e: (-len(e.tags), e.display_title.casefold()))
     elif key == "revisions_desc":
@@ -369,9 +474,9 @@ def sort_entries(entries: Iterable[Entry], sort_key: str = "updated_desc", *, re
 
 
 def tag_cooccurrence(repo, *, include_deleted: bool = False) -> Dict[tuple, int]:
-    """统计标签共现次数, 供"相关标签"推荐使用。"""
+    """统计标签共现次数, 供"相关标签"推荐使用 (覆盖三类实体)。"""
     pairs: Dict[tuple, int] = {}
-    for entry in repo.entries.values():
+    for entry in repo.items(include_deleted=include_deleted):
         if entry.deleted and not include_deleted:
             continue
         keys = sorted({tag_key(t) for t in entry.tags})
