@@ -15,11 +15,13 @@ from codemethod.core.spaces import (  # noqa: E402
     MAX_FILES_PER_SPACE,
     MAX_FILE_BYTES,
     MAX_SPACE_BINARY_BYTES,
+    SUGGESTED_LIMITS,
     DirectoryScan,
     ImportOptions,
     PlannedFile,
     ProjectFile,
     Space,
+    StorageLimits,
     build_tree,
     decode_text,
     hex_dump,
@@ -109,6 +111,15 @@ class TestBinarySniffing(unittest.TestCase):
     def test_invalid_utf8_is_binary(self):
         self.assertTrue(looks_binary(b"\xff\xfe\x00\x01"))
 
+    def test_truncated_prefix_may_end_mid_character(self):
+        """扫描只读前 1 KB, 正好切断一个多字节字符时不能误判成二进制。"""
+        text = ("中文内容。" * 200).encode("utf-8")
+        cut = text[:1001]                      # 切在 3 字节字符中间
+        self.assertTrue(looks_binary(cut))     # 当完整内容看确实不是合法 UTF-8
+        self.assertFalse(looks_binary(cut, truncated=True))
+        self.assertFalse(looks_binary(text, truncated=True))
+        self.assertTrue(looks_binary(b"abc\x00def", truncated=True))
+
     def test_decode_text_returns_none_for_binary(self):
         self.assertEqual(decode_text("你好".encode("utf-8")), "你好")
         self.assertIsNone(decode_text(b"\xff\xfe\x00"))
@@ -197,13 +208,15 @@ class TestEmbeddedBinary(unittest.TestCase):
         space.files[1].set_bytes(b"b" * 50)
         self.assertEqual(space.embedded_binary_bytes, 150)
         self.assertEqual(len(space.embedded_binary_files), 2)
-        self.assertEqual(
-            space.binary_budget_left(), MAX_SPACE_BINARY_BYTES - 150
-        )
+        # limit=0 表示不限制, 用 -1 表示"还有无限额度"
+        self.assertEqual(space.binary_budget_left(), -1)
+        self.assertFalse(space.binary_over_budget(10 ** 9))
+        # 设了上限才计算余量
+        self.assertEqual(space.binary_budget_left(1000), 850)
+        self.assertTrue(space.binary_over_budget(900, 1000))
+        self.assertFalse(space.binary_over_budget(800, 1000))
         # 覆盖已有文件时不该把这文件自己算两次
-        self.assertEqual(
-            space.binary_budget_left(exclude_path="a.bin"), MAX_SPACE_BINARY_BYTES - 50
-        )
+        self.assertEqual(space.binary_budget_left(1000, exclude_path="a.bin"), 950)
 
     def test_tree_marks_embedded_state(self):
         space = Space(name="s", files=[
@@ -419,33 +432,61 @@ class TestSpaceRepository(unittest.TestCase):
         with self.assertRaises(RepositoryError):
             self.repo.put_space_file(self.space.id, "   ", "x")
 
+    def test_nothing_is_limited_by_default(self):
+        """用户要的就是这个: 默认不限制任何文件大小与数量。"""
+        self.assertTrue(self.repo.limits.unlimited)
+        huge_text = "x" * (5 * 1024 * 1024)
+        file = self.repo.put_space_file(self.space.id, "big.txt", huge_text)
+        self.assertEqual(file.computed_size, len(huge_text))
+        big_binary = self.repo.put_space_file(
+            self.space.id, "big.bin", binary_data=b"y" * (8 * 1024 * 1024)
+        )
+        self.assertEqual(big_binary.size, 8 * 1024 * 1024)
+
+    def test_limits_survive_the_container(self):
+        self.repo.set_limits(StorageLimits(max_text_bytes=1234, max_files_per_space=7))
+        restored = Repository.from_dict(self.repo.to_dict())
+        self.assertEqual(restored.limits.max_text_bytes, 1234)
+        self.assertEqual(restored.limits.max_files_per_space, 7)
+        # 反过来: 旧文件没有 limits 键 → 默认不限制
+        data = self.repo.to_dict()
+        data.pop("limits")
+        self.assertTrue(Repository.from_dict(data).limits.unlimited)
+
+    def test_text_limit_only_applies_when_set(self):
+        self.repo.set_limits(StorageLimits(max_text_bytes=16))
+        with self.assertRaises(RepositoryError) as ctx:
+            self.repo.put_space_file(self.space.id, "big.txt", "x" * 100)
+        self.assertIn("存储限制", str(ctx.exception))
+        self.repo.set_limits(StorageLimits())
+        self.repo.put_space_file(self.space.id, "big.txt", "x" * 100)   # 不限制了
+
     def test_oversized_file_rejected(self):
+        self.repo.set_limits(StorageLimits(max_text_bytes=MAX_FILE_BYTES))
         with self.assertRaises(RepositoryError):
             self.repo.put_space_file(self.space.id, "big.py", "x" * (MAX_FILE_BYTES + 10))
 
     def test_oversized_binary_rejected(self):
+        self.repo.set_limits(StorageLimits(max_binary_bytes=MAX_BINARY_BYTES))
         with self.assertRaises(RepositoryError):
             self.repo.put_space_file(
                 self.space.id, "big.bin", binary_data=b"x" * (MAX_BINARY_BYTES + 1)
             )
 
     def test_binary_budget_enforced(self):
-        """单空间嵌入总量超限时报错 (整体预算用一个很小的假上限来测)。"""
-        from unittest import mock
-
-        import codemethod.core.spaces as spaces_mod
-
+        """单空间嵌入总量: 设了上限才拦, 0 = 不限制。"""
         space = self.repo.create_space("预算")
-        with mock.patch.object(spaces_mod, "MAX_SPACE_BINARY_BYTES", 4096):
-            self.repo.put_space_file(space.id, "first.bin", binary_data=b"y" * 4000)
-            self.assertEqual(
-                self.repo.require_space(space.id).embedded_binary_bytes, 4000
-            )
-            with self.assertRaises(RepositoryError) as ctx:
-                self.repo.put_space_file(space.id, "second.bin", binary_data=b"z" * 100)
-            self.assertIn("只剩", str(ctx.exception))
-            # 覆盖同一个文件时可以释放它自己占的额度
-            self.repo.put_space_file(space.id, "first.bin", binary_data=b"y" * 4096)
+        self.repo.set_limits(StorageLimits(max_space_binary_bytes=4096))
+        self.repo.put_space_file(space.id, "first.bin", binary_data=b"y" * 4000)
+        self.assertEqual(self.repo.require_space(space.id).embedded_binary_bytes, 4000)
+        with self.assertRaises(RepositoryError) as ctx:
+            self.repo.put_space_file(space.id, "second.bin", binary_data=b"z" * 100)
+        self.assertIn("只剩", str(ctx.exception))
+        # 覆盖同一个文件时可以释放它自己占的额度
+        self.repo.put_space_file(space.id, "first.bin", binary_data=b"y" * 4096)
+        # 关掉限制后随便塞
+        self.repo.set_limits(StorageLimits())
+        self.repo.put_space_file(space.id, "third.bin", binary_data=b"w" * 100_000)
 
     def test_embed_binary_through_put_space_file(self):
         file = self.repo.put_space_file(
@@ -458,11 +499,13 @@ class TestSpaceRepository(unittest.TestCase):
         self.assertIn("已嵌入", detail)
 
     def test_file_count_limit(self):
-        space = self.repo.create_space("满")
-        for index in range(MAX_FILES_PER_SPACE):
-            space.files.append(ProjectFile(path=f"f{index}.py", content=""))
+        self.repo.set_limits(StorageLimits(max_files_per_space=5))
+        for index in range(5):
+            self.repo.put_space_file(self.space.id, f"f{index}.py", "x")
         with self.assertRaises(RepositoryError):
-            self.repo.put_space_file(space.id, "overflow.py", "x")
+            self.repo.put_space_file(self.space.id, "overflow.py", "x")
+        self.repo.set_limits(StorageLimits())
+        self.repo.put_space_file(self.space.id, "overflow.py", "x")     # 不限制了
 
     def test_rename_file(self):
         self.repo.put_space_file(self.space.id, "a.py", "1")
@@ -646,10 +689,14 @@ class TestExternalImport(unittest.TestCase):
         self.assertEqual(len(report.skipped), 1)
 
     def test_oversized_binary_is_skipped_not_raised(self):
+        self.repo.set_limits(StorageLimits(max_binary_bytes=MAX_BINARY_BYTES))
         big = self._write("big.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
         report = self.repo.import_external_files(self.space.id, [big])
         self.assertEqual(report.changed, 0)
         self.assertIn("上限", report.skipped[0][1])
+        # 默认不限制时同样的文件直接进得来
+        self.repo.set_limits(StorageLimits())
+        self.assertEqual(self.repo.import_external_files(self.space.id, [big]).added, 1)
 
     def test_import_overwrites_existing_keeps_note(self):
         self.repo.put_space_file(self.space.id, "logo.png", "", binary=True, size=1)
@@ -844,19 +891,36 @@ class TestDirectoryPackaging(unittest.TestCase):
         )
         self.assertEqual({f.path for f in scan.included}, {"README.md", ".gitignore"})
 
-    def test_big_text_is_embedded_as_bytes_instead_of_skipped(self):
-        """3 MB 的纯文本放不进编辑器, 但"完全打包"不该把它丢掉。"""
+    def test_big_text_stays_text_when_unlimited(self):
+        """不限制时, 3 MB 的纯文本就该原样当文本存 (内容进检索)。"""
         self._write("big.log", b"x" * (MAX_FILE_BYTES + 1024))
         scan = scan_external_directory(self.root, ImportOptions())
+        item = next(f for f in scan.included if f.path == "big.log")
+        self.assertFalse(item.binary)
+
+    def test_text_limit_can_divert_big_text_to_binary(self):
+        self._write("big.log", b"x" * (MAX_FILE_BYTES + 1024))
+        scan = scan_external_directory(
+            self.root, ImportOptions(max_text_bytes=MAX_FILE_BYTES, max_binary_bytes=MAX_BINARY_BYTES)
+        )
         item = next(f for f in scan.included if f.path == "big.log")
         self.assertTrue(item.binary)
 
     def test_file_over_binary_limit_is_reported(self):
         self._write("huge.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
-        scan = scan_external_directory(self.root, ImportOptions())
+        scan = scan_external_directory(
+            self.root, ImportOptions(max_binary_bytes=MAX_BINARY_BYTES)
+        )
         skipped = [f for f in scan.skipped if f.path == "huge.bin"]
         self.assertEqual(len(skipped), 1)
         self.assertIn("上限", skipped[0].reason)
+
+    def test_nothing_is_skipped_for_size_by_default(self):
+        self._write("huge.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
+        self._write("huge.log", b"x" * (MAX_FILE_BYTES + 16))
+        scan = scan_external_directory(self.root, ImportOptions())
+        self.assertEqual({f.path for f in scan.included}, {"huge.bin", "huge.log"})
+        self.assertEqual(scan.skipped, [])
 
     def test_scan_missing_directory_reports_error(self):
         scan = scan_external_directory(os.path.join(self.root, "nope"), ImportOptions())
@@ -871,10 +935,18 @@ class TestDirectoryPackaging(unittest.TestCase):
         self.assertTrue(all(f.path.startswith("vendor/lib/") for f in scan.included))
 
     def test_scan_does_not_read_whole_big_file(self):
-        """扫描只读每个文件的前 8 KB, 所以几千个文件也很快。"""
+        """扫描只读每个文件的一小段, 所以几千个文件也很快。"""
         self._write("big.bin", b"\x00" * (2 * 1024 * 1024))
         scan = scan_external_directory(self.root, ImportOptions())
         self.assertEqual(scan.included[0].size, 2 * 1024 * 1024)
+
+    def test_scan_handles_many_files(self):
+        for index in range(300):
+            self._write(f"src/f{index}.py", b"x = 1\n")
+        scan = scan_external_directory(self.root, ImportOptions())
+        self.assertEqual(len(scan.included), 300)
+        self.assertEqual(scan.skipped, [])
+        self.assertTrue(all(not f.binary for f in scan.included))
 
     # ---- 执行 ----
     def test_import_scan_matches_the_plan(self):
@@ -897,25 +969,27 @@ class TestDirectoryPackaging(unittest.TestCase):
     def test_import_scan_records_skipped_files(self):
         self._write("ok.txt", b"1")
         self._write("huge.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
-        scan = scan_external_directory(self.root, ImportOptions())
+        self.repo.set_limits(StorageLimits(max_binary_bytes=MAX_BINARY_BYTES))
+        scan = scan_external_directory(
+            self.root, ImportOptions(max_binary_bytes=MAX_BINARY_BYTES)
+        )
         report = self.repo.import_scan(self.space.id, scan)
         self.assertEqual(report.added, 1)
         self.assertEqual(len(report.skipped), 1)
         self.assertIn("huge.bin", report.skipped[0][0])
 
     def test_import_scan_refuses_to_blow_the_binary_budget(self):
-        from unittest import mock
-
-        import codemethod.core.spaces as spaces_mod
-
         self._project()
         scan = scan_external_directory(self.root, ImportOptions())
-        with mock.patch.object(spaces_mod, "MAX_SPACE_BINARY_BYTES", 10):
-            with self.assertRaises(RepositoryError) as ctx:
-                self.repo.import_scan(self.space.id, scan)
-            self.assertIn("只剩", str(ctx.exception))
-            report = self.repo.import_scan(self.space.id, scan, force=True)
+        self.repo.set_limits(StorageLimits(max_space_binary_bytes=10))
+        with self.assertRaises(RepositoryError) as ctx:
+            self.repo.import_scan(self.space.id, scan)
+        self.assertIn("只剩", str(ctx.exception))
+        report = self.repo.import_scan(self.space.id, scan, force=True)
         self.assertGreater(report.added, 0)
+        # 关掉限制后同样的计划可以随便导
+        self.repo.set_limits(StorageLimits())
+        self.assertEqual(self.repo.import_scan(self.space.id, scan).changed, len(scan.included))
 
     def test_import_external_directory_uses_the_same_planner(self):
         self._project()

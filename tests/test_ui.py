@@ -21,7 +21,7 @@ try:
     from codemethod.core.languages import LANGUAGES, all_languages
     from codemethod.core.models import Implementation
     from codemethod.core.repository import Repository
-    from codemethod.core.spaces import ProjectFile
+    from codemethod.core.spaces import ProjectFile, StorageLimits
     from codemethod.storage.database import Database
     from codemethod.ui.editor import CodeEditor, CodePreview, DiffView
     from codemethod.ui.highlighter import build_rules, highlighted_tokens
@@ -1631,12 +1631,22 @@ class TestDirectoryPackagingUI(_TrackedWidgets):
             self.assertEqual({f.path for f in dialog.scan().included}, {"README.md"})
 
     def test_dialog_blocks_when_budget_is_short_until_forced(self):
+        """只有在库里设了上限时才谈"预算"; 默认不限制就不该出现这个复选框。"""
         import tempfile
 
         from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
 
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project(tmp)
+            # 默认 (budget_left=None) = 不限制
+            unlimited = self.track(
+                DirectoryImportDialog(theme=get_theme("dark+"), budget_left=None)
+            )
+            unlimited.path_edit.setText(str(root))
+            self.app.processEvents()
+            self.assertTrue(unlimited.force_check.isHidden())
+            self.assertTrue(unlimited.import_button.isEnabled())
+
             dialog = self.track(
                 DirectoryImportDialog(theme=get_theme("dark+"), budget_left=0)
             )
@@ -1746,6 +1756,116 @@ class TestDirectoryPackagingUI(_TrackedWidgets):
             self.assertTrue(placeholder_preference())
         finally:
             set_placeholder_preference(original)
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestStorageLimits(_TrackedWidgets):
+    """存储限制默认全部关闭, 且可以自己设置。"""
+
+    def test_default_is_unlimited(self):
+        db = Database.create()
+        self.assertTrue(db.repository.limits.unlimited)
+        self.assertEqual(db.repository.limits.summary, "不限制")
+
+    def test_dialog_round_trips_limits(self):
+        from codemethod.ui.dialogs.limits_dialog import LimitsDialog
+
+        db = Database.create()
+        dialog = self.track(LimitsDialog(repository=db.repository, theme=get_theme("dark+")))
+        self.assertTrue(dialog.result_limits().unlimited)   # 打开时就是"不限制"
+
+        dialog._apply_suggested()
+        limits = dialog.result_limits()
+        self.assertEqual(limits.max_text_bytes, 2 * 1024 * 1024)
+        self.assertEqual(limits.max_binary_bytes, 4 * 1024 * 1024)
+        self.assertEqual(limits.max_files_per_space, 2000)
+
+        dialog._apply_unlimited()
+        self.assertTrue(dialog.result_limits().unlimited)
+
+    def test_set_limits_persists_in_the_container(self):
+        db = Database.create()
+        db.repository.set_limits(StorageLimits(max_files_per_space=3))
+        data = db.repository.to_dict()
+        self.assertEqual(data["limits"]["max_files_per_space"], 3)
+        restored = Repository.from_dict(data)
+        self.assertEqual(restored.limits.max_files_per_space, 3)
+        self.assertTrue(restored.statistics()["limits_summary"] != "")
+
+    def test_window_action_updates_the_repository(self):
+        from codemethod.ui.dialogs.limits_dialog import LimitsDialog
+
+        db = Database.create()
+        window = self.track(MainWindow(db))
+        window.show()
+
+        def fake_exec(dialog_self):
+            dialog_self._apply_suggested()
+            return LimitsDialog.DialogCode.Accepted
+
+        from unittest import mock
+
+        with mock.patch.object(LimitsDialog, "exec", fake_exec):
+            window.show_limits_dialog()
+        self.assertEqual(db.repository.limits.max_text_bytes, 2 * 1024 * 1024)
+        window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestLargeDocumentGuard(_TrackedWidgets):
+    """不再限制文件大小之后, 超大文件靠编辑器降级来保证不卡死。"""
+
+    def test_small_document_keeps_highlighting(self):
+        editor = self.track(CodeEditor(language="python", theme=get_theme("dark+")))
+        editor.setPlainText("def f():\n    return 1\n")
+        self.assertFalse(editor.highlight_suppressed)
+
+    def test_huge_document_suppresses_highlighting(self):
+        editor = self.track(CodeEditor(language="python", theme=get_theme("dark+")))
+        editor.setPlainText("x = 1\n" * 40_000)          # 超过行数阈值
+        self.assertTrue(editor.highlight_suppressed)
+
+    def test_guard_decides_before_the_text_goes_in(self):
+        """必须在 setPlainText 之前就摘掉高亮器, 否则会先跑几十万次回调。"""
+        editor = self.track(CodeEditor(language="python", theme=get_theme("dark+")))
+        editor.setPlainText("y = 2\n" * 40_000)
+        self.assertTrue(editor.highlight_suppressed)
+        self.assertIsNone(editor._highlighter.document())
+
+    def test_highlighting_comes_back_when_document_shrinks(self):
+        editor = self.track(CodeEditor(language="python", theme=get_theme("dark+")))
+        editor.setPlainText("z = 3\n" * 40_000)
+        self.assertTrue(editor.highlight_suppressed)
+        editor.setPlainText("def f():\n    return 1\n")
+        self.assertFalse(editor.highlight_suppressed)
+        self.assertIsNotNone(editor._highlighter.document())
+
+    def test_preview_shows_a_notice(self):
+        preview = self.track(CodePreview(theme=get_theme("dark+")))
+        preview.set_code("w = 4\n" * 40_000, language="python")
+        self.assertTrue(preview.highlight_suppressed)
+        self.assertIn("语法高亮", preview._highlight_notice.text())
+        preview.set_code("def f():\n    return 1\n", language="python")
+        self.assertEqual(preview._highlight_notice.text(), "")
+
+    def test_big_text_file_still_saves_and_reopens(self):
+        """不限制之后, 一个 3 MB 的文本文件必须能原样存进空间再读出来。"""
+        db = Database.create()
+        space = db.repository.create_space("大文件")
+        body = "hello world\n" * 250_000          # ~3 MB
+        db.repository.put_space_file(space.id, "big.log", body)
+        file = db.repository.require_space(space.id).get_file("big.log")
+        self.assertEqual(len(file.content), len(body))
+        self.assertFalse(file.binary)
+
+        window = self.track(MainWindow(db))
+        window.show()
+        window.entry_list.select_entry(space.id)
+        window.refresh_detail()
+        window.space_panel.show_file("big.log")
+        self.app.processEvents()
+        self.assertTrue(window.space_panel.preview.highlight_suppressed)
+        window.close()
 
 
 if __name__ == "__main__":

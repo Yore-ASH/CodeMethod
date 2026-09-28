@@ -63,12 +63,18 @@ class DirectoryImportDialog(ThemedDialog):
         directory: str = "",
         target_dir: str = "",
         budget_left: Optional[int] = None,
+        max_text_bytes: int = 0,
+        max_binary_bytes: int = 0,
         import_label: str = "导入",
     ) -> None:
         super().__init__(parent)
         self._theme = theme
         self._scan: Optional[DirectoryScan] = None
-        self._budget_left = budget_left
+        self._budget_left = int(budget_left or 0)
+        # None = 库里没设上限 → 不谈"预算"; 传 0 也是有效限制 (一点都放不下了)
+        self._budget_enabled = budget_left is not None
+        self._max_text_bytes = int(max_text_bytes or 0)
+        self._max_binary_bytes = int(max_binary_bytes or 0)
 
         self.setWindowTitle("把整个目录打包进空间")
         self.setMinimumSize(720, 460)
@@ -185,6 +191,9 @@ class DirectoryImportDialog(ThemedDialog):
             include_caches=self.cache_check.isChecked(),
             keep_structure=self.structure_check.isChecked(),
             target_dir=normalize_project_path(self.target_edit.text()),
+            # 0 = 不限制 (代码库默认就是全 0)
+            max_text_bytes=self._max_text_bytes,
+            max_binary_bytes=self._max_binary_bytes,
         )
 
     def _browse(self) -> None:
@@ -247,11 +256,12 @@ class DirectoryImportDialog(ThemedDialog):
             )
 
         over_budget = False
-        if self._budget_left is not None and scan.binary_bytes > self._budget_left:
+        if self._budget_enabled and scan.binary_bytes > self._budget_left:
             over_budget = True
             warnings.append(
                 f"⚠ 这次要嵌入 <b>{human_bytes(scan.binary_bytes)}</b> 的二进制内容, "
-                f"但空间只剩 <b>{human_bytes(self._budget_left)}</b>。"
+                f"但空间只剩 <b>{human_bytes(self._budget_left)}</b> "
+                "(你在「存储限制…」里设了上限)。"
                 "可以减少文件, 或勾上下面的「仍然导入」。"
             )
         self.force_check.setVisible(over_budget)
@@ -272,9 +282,7 @@ class DirectoryImportDialog(ThemedDialog):
         if scan is None or scan.error or not scan.included:
             self.import_button.setEnabled(False)
             return
-        over_budget = (
-            self._budget_left is not None and scan.binary_bytes > self._budget_left
-        )
+        over_budget = self._budget_enabled and scan.binary_bytes > self._budget_left
         self.import_button.setEnabled(not over_budget or self.force_check.isChecked())
 
     def _build_rows(self, scan: DirectoryScan) -> None:

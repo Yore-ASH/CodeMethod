@@ -58,6 +58,7 @@ from .dialogs.directory_import import DirectoryImportDialog
 from .dialogs.entry_editor import EntryEditorDialog
 from .dialogs.function_editor import FunctionEditorDialog
 from .dialogs.implementation_dialog import ImplementationDialog
+from .dialogs.limits_dialog import LimitsDialog
 from .dialogs.new_directory import PLACEHOLDER_NAME, NewDirectoryDialog
 from .dialogs.readme_search import ReadmeSearchDialog
 from .dialogs.space_editor import SpaceEditorDialog
@@ -291,6 +292,10 @@ class MainWindow(QMainWindow):
         self.act_convert_text = self._act("转换为文本容器 (.cmj)…", lambda: self.convert_format(False))
         self.act_container_info = self._act("容器信息…", self.show_container_info, tip="查看当前文件的格式、大小、清单")
         self.act_verify = self._act("校验文件完整性…", self.verify_file, tip="检查魔数、CRC32、SHA-256")
+        self.act_limits = self._act(
+            "存储限制…", self.show_limits_dialog,
+            tip="文件大小/数量限制 (默认全部不限制, 想设才设)",
+        )
         self.act_quit = self._act("退出", self.close, shortcut="Ctrl+Q")
 
         # ---- 模块 (原"条目", 换个更贴切的名字) ----
@@ -507,6 +512,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.act_container_info)
         file_menu.addAction(self.act_verify)
+        file_menu.addAction(self.act_limits)
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
 
@@ -1345,6 +1351,7 @@ class MainWindow(QMainWindow):
             self,
             existing_tags=self.db.repository.all_tags(),
             theme=self.theme,
+            limits=self.db.repository.limits,
         )
         if dialog.exec() != SpaceEditorDialog.DialogCode.Accepted:
             return
@@ -1381,6 +1388,7 @@ class MainWindow(QMainWindow):
             space=space,
             existing_tags=self.db.repository.all_tags(),
             theme=self.theme,
+            limits=self.db.repository.limits,
         )
         if dialog.exec() != SpaceEditorDialog.DialogCode.Accepted:
             return
@@ -1567,6 +1575,15 @@ class MainWindow(QMainWindow):
             return
         self._embed_external(space.id, chosen, base_dir="", target_dir=directory)
 
+    def show_limits_dialog(self) -> None:
+        """查看 / 修改当前代码库的存储限制 (默认全部不限制)。"""
+        dialog = LimitsDialog(self, repository=self.db.repository, theme=self.theme)
+        if dialog.exec() != LimitsDialog.DialogCode.Accepted:
+            return
+        limits = self.db.repository.set_limits(dialog.result_limits())
+        self.refresh_stats()
+        self.set_status(f"存储限制已更新: {limits.summary}")
+
     def import_directory_into_space(self, space_id: str = "") -> None:
         """「把整个目录打包进空间」的统一入口 (菜单 / 工具栏 / 详情面板都走这里)。
 
@@ -1611,7 +1628,13 @@ class MainWindow(QMainWindow):
         dialog = DirectoryImportDialog(
             self,
             theme=self.theme,
-            budget_left=space.binary_budget_left(),
+            budget_left=(
+                space.binary_budget_left(self.db.repository.limits.max_space_binary_bytes)
+                if self.db.repository.limits.max_space_binary_bytes
+                else None
+            ),
+            max_text_bytes=self.db.repository.limits.max_text_bytes,
+            max_binary_bytes=self.db.repository.limits.max_binary_bytes,
         )
         if dialog.exec() != DirectoryImportDialog.DialogCode.Accepted:
             return

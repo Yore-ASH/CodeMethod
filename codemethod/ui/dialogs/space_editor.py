@@ -43,11 +43,11 @@ from PySide6.QtWidgets import (
 from ...core.languages import detect_language_from_filename, get_language
 from ...core.models import STATUS_LABELS, STATUS_ORDER, normalize_tags
 from ...core.spaces import (
-    MAX_BINARY_BYTES,
-    MAX_FILE_BYTES,
-    MAX_SPACE_BINARY_BYTES,
+    CACHE_DIR_NAMES,
+    VCS_DIR_NAMES,
     ProjectFile,
     Space,
+    StorageLimits,
     build_tree,
     decode_text,
     human_bytes,
@@ -74,12 +74,15 @@ class SpaceEditorDialog(ThemedDialog):
         space: Optional[Space] = None,
         existing_tags: Optional[List[str]] = None,
         theme: Theme = DEFAULT_THEME,
+        limits: Optional[StorageLimits] = None,
     ) -> None:
         super().__init__(parent)
         self._theme = theme
         self._space = space
         self._is_new = space is None
         self._loading = True
+        # 限制默认全 0 (不限制); 主窗口会把当前库的设置传进来
+        self._limits = limits or StorageLimits()
         self._dirty_paths: set = set()      # 内容被改动过的文件路径 (提交时据此写回)
 
         self.setWindowTitle("新建空间" if self._is_new else "编辑空间")
@@ -379,13 +382,18 @@ class SpaceEditorDialog(ThemedDialog):
             self._loading = False
 
     def _update_size_label(self, file: ProjectFile) -> None:
+        limits = self._limits
         if file.binary:
             if file.data:
-                self.size_label.setText(
-                    f"二进制 · {human_bytes(file.size)} · 内容已嵌入库内 "
-                    f"(base64 后约 {human_bytes(file.stored_bytes)}), 上限 "
-                    f"{human_bytes(MAX_BINARY_BYTES)}"
-                )
+                bits = [
+                    f"二进制 · {human_bytes(file.size)} · 内容已嵌入库内",
+                    f"(base64 后约 {human_bytes(file.stored_bytes)})",
+                ]
+                if limits.max_binary_bytes:
+                    bits.append(f"上限 {human_bytes(limits.max_binary_bytes)}")
+                    if file.size > limits.max_binary_bytes:
+                        bits.append("⚠ 超过你设的上限")
+                self.size_label.setText(" ".join(bits))
             else:
                 self.size_label.setText(
                     f"二进制 · {human_bytes(file.size)} · ⚠ 只有大小记录, 没有内容 —— "
@@ -393,11 +401,14 @@ class SpaceEditorDialog(ThemedDialog):
                 )
             return
         size = file.computed_size
-        limit = f" / 上限 {MAX_FILE_BYTES // 1024} KB"
-        self.size_label.setText(
-            f"{file.line_count} 行 · {human_bytes(size)}{limit}"
-            + ("   ⚠ 超过上限, 保存会被拒绝" if size > MAX_FILE_BYTES else "")
-        )
+        bits = [f"{file.line_count} 行 · {human_bytes(size)}"]
+        if limits.max_text_bytes:
+            bits.append(f"上限 {human_bytes(limits.max_text_bytes)}")
+            if size > limits.max_text_bytes:
+                bits.append("⚠ 超过你设的上限, 保存会被拦下")
+        if self.code_editor.highlight_suppressed:
+            bits.append("(文件较大, 已关闭语法高亮, 内容不受影响)")
+        self.size_label.setText("  ".join(bits))
 
     def _on_code_changed(self) -> None:
         if self._loading:
@@ -510,9 +521,11 @@ class SpaceEditorDialog(ThemedDialog):
                 continue
 
             binary = is_binary_path(target) or looks_binary(raw)
+            limit_binary = self._limits.max_binary_bytes
+            limit_text = self._limits.max_text_bytes
             if binary:
-                if len(raw) > MAX_BINARY_BYTES:
-                    skipped.append(f"{name}: 超过单文件上限 {human_bytes(MAX_BINARY_BYTES)}")
+                if limit_binary and len(raw) > limit_binary:
+                    skipped.append(f"{name}: 超过二进制上限 {human_bytes(limit_binary)}")
                     continue
                 file = ProjectFile(path=target, binary=True)
                 file.set_bytes(raw)
@@ -521,8 +534,8 @@ class SpaceEditorDialog(ThemedDialog):
                 if body is None:      # pragma: no cover
                     skipped.append(f"{name}: 无法识别为文本")
                     continue
-                if len(raw) > MAX_FILE_BYTES:
-                    skipped.append(f"{name}: 超过单文件上限 {human_bytes(MAX_FILE_BYTES)}")
+                if limit_text and len(raw) > limit_text:
+                    skipped.append(f"{name}: 超过文本上限 {human_bytes(limit_text)}")
                     continue
                 file = ProjectFile(path=target, content=body)
 
@@ -550,14 +563,15 @@ class SpaceEditorDialog(ThemedDialog):
         用的是和主窗口同一个 :class:`DirectoryImportDialog` —— 先扫描出完整计划给用户
         过目, 确认后照着**同一份计划**读文件, 直接写进对话框的工作副本 (点保存才落库)。
         """
+        budget = self._limits.max_space_binary_bytes
+        used = sum(f.size for f in self._files() if f.binary and f.data)
         dialog = DirectoryImportDialog(
             self,
             theme=self._theme,
             target_dir=self._selected_directory(),
-            budget_left=max(
-                0, MAX_SPACE_BINARY_BYTES
-                - sum(f.size for f in self._files() if f.binary and f.data)
-            ),
+            budget_left=(max(0, budget - used) if budget else None),
+            max_text_bytes=self._limits.max_text_bytes,
+            max_binary_bytes=self._limits.max_binary_bytes,
             import_label="加入",
         )
         if dialog.exec() != DirectoryImportDialog.DialogCode.Accepted:
@@ -626,11 +640,14 @@ class SpaceEditorDialog(ThemedDialog):
         except OSError as exc:
             QMessageBox.warning(self, "读取失败", str(exc.strerror or exc))
             return
-        if len(raw) > MAX_BINARY_BYTES:
+        limit = self._limits.max_binary_bytes
+        if limit and len(raw) > limit:
             QMessageBox.warning(
                 self,
-                "文件过大",
-                f"上限 {human_bytes(MAX_BINARY_BYTES)}, 这个文件有 {human_bytes(len(raw))}。",
+                "文件超过当前上限",
+                f"你在「存储限制…」里设了单个二进制文件上限 {human_bytes(limit)}, "
+                f"这个文件有 {human_bytes(len(raw))}。\n\n"
+                "把那一项设为「不限制」就不会再拦。",
             )
             return
         file = self._work_files.get(path)
@@ -753,37 +770,56 @@ class SpaceEditorDialog(ThemedDialog):
             QMessageBox.warning(self, "缺少名称", "请填写空间名称。")
             self.name_edit.setFocus()
             return
-        oversized = [
-            f.path for f in self._files()
-            if not f.binary and f.computed_size > MAX_FILE_BYTES
-        ]
-        if oversized:
+        # 限制默认全 0 = 不限制; 只有用户自己设了值才在这里拦一下
+        limits = self._limits
+        if limits.max_text_bytes:
+            oversized = [
+                f.path for f in self._files()
+                if not f.binary and f.computed_size > limits.max_text_bytes
+            ]
+            if oversized:
+                QMessageBox.warning(
+                    self,
+                    "文件超过当前文本上限",
+                    f"你在「存储限制…」里设了文本文件上限 "
+                    f"{human_bytes(limits.max_text_bytes)}, 以下文件超了:\n\n"
+                    + "\n".join(oversized[:10])
+                    + "\n\n（把那一项设为「不限制」就不会再拦）",
+                )
+                return
+        if limits.max_binary_bytes:
+            too_big_binary = [
+                f.path for f in self._files()
+                if f.binary and f.size > limits.max_binary_bytes
+            ]
+            if too_big_binary:
+                QMessageBox.warning(
+                    self,
+                    "二进制文件超过当前上限",
+                    f"你在「存储限制…」里设了单个二进制文件上限 "
+                    f"{human_bytes(limits.max_binary_bytes)}, 以下文件超了:\n\n"
+                    + "\n".join(too_big_binary[:10])
+                    + "\n\n（把那一项设为「不限制」就不会再拦）",
+                )
+                return
+        if limits.max_space_binary_bytes:
+            embedded = sum(f.size for f in self._files() if f.binary and f.data)
+            if embedded > limits.max_space_binary_bytes:
+                QMessageBox.warning(
+                    self,
+                    "嵌入内容超过当前上限",
+                    f"这个空间嵌入了 {human_bytes(embedded)} 的二进制内容, 超过你设的 "
+                    f"{human_bytes(limits.max_space_binary_bytes)}。\n\n"
+                    "请删掉一些大文件, 或去「存储限制…」把这一项设为「不限制」。",
+                )
+                return
+        if limits.max_files_per_space and len(self._files()) > limits.max_files_per_space:
             QMessageBox.warning(
                 self,
-                "文件过大",
-                "以下文件超过单文件上限 "
-                f"{human_bytes(MAX_FILE_BYTES)}, 请拆分或删减:\n\n" + "\n".join(oversized[:10]),
-            )
-            return
-        too_big_binary = [
-            f.path for f in self._files()
-            if f.binary and f.size > MAX_BINARY_BYTES
-        ]
-        if too_big_binary:
-            QMessageBox.warning(
-                self,
-                "二进制文件过大",
-                f"单个二进制文件上限 {human_bytes(MAX_BINARY_BYTES)}, 以下文件超了:\n\n"
-                + "\n".join(too_big_binary[:10]),
-            )
-            return
-        embedded = sum(f.size for f in self._files() if f.binary and f.data)
-        if embedded > MAX_SPACE_BINARY_BYTES:
-            QMessageBox.warning(
-                self,
-                "嵌入内容过多",
-                f"这个空间嵌入了 {human_bytes(embedded)} 的二进制内容, 超过单空间上限 "
-                f"{human_bytes(MAX_SPACE_BINARY_BYTES)}。请删掉一些大文件。",
+                "文件数量超过当前上限",
+                f"这个空间有 {len(self._files())} 个文件, 超过你设的 "
+                f"{limits.max_files_per_space} 个。\n\n"
+                "请删掉一些, 或去「存储限制…」把这一项设为「不限制」。",
             )
             return
         self.accept()

@@ -818,16 +818,23 @@ def run_self_test(report_path: Optional[str] = None) -> int:
             and "打包导入" in repo.revisions(pack_space.id)[0].summary,
             repo.revisions(pack_space.id)[0].summary,
         )
-        from unittest import mock as _mock
+        from .core.spaces import StorageLimits
 
-        with _mock.patch("codemethod.core.spaces.MAX_SPACE_BINARY_BYTES", 1):
-            try:
-                repo.import_scan(pack_space.id, pack_scan)
-                check("超预算时拒绝打包", False, "竟然没报错")
-            except Exception as exc:
-                check("超预算时拒绝打包", "只剩" in str(exc), str(exc).splitlines()[0])
-            forced = repo.import_scan(pack_space.id, pack_scan, force=True)
-            check("显式确认后可以越过软上限", forced.changed > 0, forced.summary())
+        # 默认不限制: 再大再多的文件都应该能进得去
+        check(
+            "存储限制默认不限制",
+            repo.limits.unlimited and repo.to_dict()["limits"] == StorageLimits().to_dict(),
+            repo.limits.summary,
+        )
+        repo.set_limits(StorageLimits(max_space_binary_bytes=1))
+        try:
+            repo.import_scan(pack_space.id, pack_scan)
+            check("设了上限之后才会拦截", False, "竟然没报错")
+        except Exception as exc:
+            check("设了上限之后才会拦截", "只剩" in str(exc), str(exc).splitlines()[0])
+        forced = repo.import_scan(pack_space.id, pack_scan, force=True)
+        check("显式确认后可以越过上限", forced.changed > 0, forced.summary())
+        repo.set_limits(StorageLimits())      # 恢复不限制
         repo.delete_item(pack_space.id, hard=True)
 
         # ---- 标签统计必须覆盖三类实体 ----

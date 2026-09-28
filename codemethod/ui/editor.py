@@ -81,10 +81,20 @@ class LineNumberArea(QWidget):
 
 
 class CodeEditor(QPlainTextEdit):
-    """带行号与语法高亮的代码编辑器。"""
+    """带行号与语法高亮的代码编辑器。
+
+    文件大小**不设限制**, 但语法高亮有性能护栏: 高亮器是纯 Python 正则, 对超大文档
+    会卡住界面。所以文档超过 :data:`LARGE_DOCUMENT_CHARS` 或
+    :data:`LARGE_DOCUMENT_BLOCKS` 时**自动降级成纯文本显示** —— 内容一个字节都不少,
+    只是不再上色 (:attr:`highlight_suppressed` 为 True, 界面可以据此给出提示)。
+    """
 
     TAB_WIDTH = 4
     _BRACKETS = {"(": ")", "[": "]", "{": "}", ")": "(", "]": "[", "}": "{"}
+
+    # 超过任一条就关掉语法高亮 (只影响上色, 不影响内容)
+    LARGE_DOCUMENT_CHARS = 1_200_000
+    LARGE_DOCUMENT_BLOCKS = 30_000
 
     def __init__(
         self,
@@ -98,9 +108,9 @@ class CodeEditor(QPlainTextEdit):
         self._theme = theme
         self._language = normalize_language(language)
         self._line_number_area = LineNumberArea(self)
-        self._highlighter: QSyntaxHighlighter = create_highlighter(
-            self.document(), self._language, theme
-        )
+        # 是否因为文档太大而主动关掉了语法高亮
+        self.highlight_suppressed = False
+        self._highlighter: QSyntaxHighlighter = self._make_highlighter()
 
         self.setReadOnly(read_only)
         self.setFont(mono_font(theme.mono_font_size))
@@ -127,6 +137,37 @@ class CodeEditor(QPlainTextEdit):
     def language(self) -> str:
         return self._language
 
+    def _is_large(self, chars: int, blocks: int) -> bool:
+        return chars > self.LARGE_DOCUMENT_CHARS or blocks > self.LARGE_DOCUMENT_BLOCKS
+
+    def _apply_highlight_guard(self, *, chars: Optional[int] = None, blocks: Optional[int] = None) -> None:
+        """按(即将成为的)文档大小决定要不要挂语法高亮器。
+
+        关键是**必须在内容进去之前**决定 —— 否则高亮器会先把几十万个 block 全跑一遍,
+        界面直接卡死十几秒。
+        """
+        if chars is None or blocks is None:
+            document = self.document()
+            chars = document.characterCount()
+            blocks = document.blockCount()
+        large = self._is_large(int(chars), int(blocks))
+        if large == self.highlight_suppressed:
+            return
+        self.highlight_suppressed = large
+        # 先摘掉旧高亮器, 再决定挂不挂新的: 超大文档干脆不挂, 省掉每个 block 的一次回调
+        self._highlighter.setDocument(None)
+        if not large:
+            self._highlighter = create_highlighter(self.document(), self._language, self._theme)
+
+    def _make_highlighter(self) -> QSyntaxHighlighter:
+        """构造时的初始高亮器 (此时文档还是空的, 一定不需要降级)。"""
+        self.highlight_suppressed = False
+        return create_highlighter(self.document(), self._language, self._theme)
+
+    def refresh_highlighting(self) -> None:
+        """文档换掉之后重算一次护栏 (超限就降级, 变小了再恢复)。"""
+        self._apply_highlight_guard()
+
     def set_language(self, language: str) -> None:
         normalized = normalize_language(language)
         if normalized == self._language:
@@ -134,7 +175,14 @@ class CodeEditor(QPlainTextEdit):
         self._language = normalized
         # 语言变化时高亮器类型可能变化 (纯文本 <-> 语法高亮), 因此重建
         self._highlighter.setDocument(None)
-        self._highlighter = create_highlighter(self.document(), normalized, self._theme)
+        if not self.highlight_suppressed:
+            self._highlighter = create_highlighter(self.document(), self._language, self._theme)
+
+    def setPlainText(self, text: str) -> None:  # noqa: N802 - Qt 命名
+        body = text or ""
+        # 先按"即将变成的规模"决定高亮, 再真正塞内容
+        self._apply_highlight_guard(chars=len(body), blocks=body.count("\n") + 1)
+        super().setPlainText(body)
 
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
@@ -455,6 +503,13 @@ class CodePreview(QWidget):
         self._file_label.setObjectName("MutedLabel")
         self._position_label = QLabel("", header)
         self._position_label.setObjectName("DimLabel")
+        # 文档太大时高亮会降级 —— 明确告诉用户"内容没少, 只是没上色"
+        self._highlight_notice = QLabel("", header)
+        self._highlight_notice.setObjectName("DimLabel")
+        self._highlight_notice.setToolTip(
+            "这个文件太大, 语法高亮会影响流畅度, 已自动改为纯文本显示。\n"
+            "内容一个字节都不会少, 只是不再上色。"
+        )
 
         self._copy_button = _IconButton("复制", "复制全部代码到剪贴板 (Ctrl+Shift+C)", header)
         self._copy_button.clicked.connect(self._on_copy)
@@ -471,6 +526,7 @@ class CodePreview(QWidget):
 
         row.addWidget(self._lang_label)
         row.addWidget(self._file_label)
+        row.addWidget(self._highlight_notice)
         row.addStretch(1)
         row.addWidget(self._position_label)
         row.addWidget(self._copy_button)
@@ -526,6 +582,18 @@ class CodePreview(QWidget):
         self.editor.setPlainText(code or "")
         self.editor.moveCursor(QTextCursor.MoveOperation.Start)
         self._update_position_label()
+        self._update_highlight_notice()
+
+    def _update_highlight_notice(self) -> None:
+        if self._header is None:
+            return
+        self._highlight_notice.setText(
+            "⚠ 文件较大, 已关闭语法高亮" if self.editor.highlight_suppressed else ""
+        )
+
+    @property
+    def highlight_suppressed(self) -> bool:
+        return self.editor.highlight_suppressed
 
     def code(self) -> str:
         return self.editor.toPlainText()

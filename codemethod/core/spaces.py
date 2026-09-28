@@ -50,10 +50,104 @@ BINARY_EXTENSIONS = frozenset(
 # 可以直接在界面里预览的图片类型
 IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"})
 
-MAX_FILE_BYTES = 2 * 1024 * 1024      # 单文件文本内容上限, 防止库被巨型文件撑爆
-MAX_BINARY_BYTES = 4 * 1024 * 1024    # 单个二进制文件的嵌入上限
-MAX_SPACE_BINARY_BYTES = 32 * 1024 * 1024   # 单个空间里全部嵌入二进制的总量上限
-MAX_FILES_PER_SPACE = 2000
+
+# --------------------------------------------------------------------------------------
+# 存储限制
+# --------------------------------------------------------------------------------------
+#
+# **默认全部不限制** —— 你的库你做主, 喜欢塞多大的文件就塞多大的。
+#
+# 这里只提供一组"如果库变慢了可以拿来用"的推荐值 (``SUGGESTED_LIMITS``),
+# 以及一个可以随时改的 ``StorageLimits``。真正的限制值存在代码库里, 跟着 .cmdb 走。
+#
+# 为什么曾经有硬上限 (现在为什么改成可选):
+#
+# * **语法高亮**是纯 Python 正则, 对超大文件会卡住界面 —— 这一点**不靠限制文件大小**
+#   解决, 而是靠编辑器自身的降级 (见 ui/editor.py 的 LARGE_DOCUMENT_*), 超过阈值就
+#   关掉高亮, 内容一个字节都不少;
+# * **全文检索**会把每个文件的内容 casefold 成一份索引文本常驻内存, 库特别大时内存
+#   会成倍增长 —— 现在给索引缓存加了总量预算, 超了就淘汰最大的那几条, 而不是拒绝导入;
+# * **修订历史是全量快照**, 一个反复修改的大文件会在历史里留下多份 —— 这是"任意时刻
+#   都能完整还原"的代价, 属于设计取舍, 不该靠拒绝用户来回避;
+# * 保存/读取要把整个库序列化成 JSON 再 zlib 压缩, 库越大越慢、峰值内存越高。
+#
+# 所以现在: 默认不限制; 真想设限就去「文件 → 存储限制…」自己填, 并能在那里看到
+# 每一项的代价说明。
+
+@dataclass
+class StorageLimits:
+    """空间文件的存储限制。**每一项 0 都表示不限制** (这也是默认值)。"""
+
+    max_text_bytes: int = 0            # 单个文本文件
+    max_binary_bytes: int = 0          # 单个二进制文件
+    max_space_binary_bytes: int = 0    # 单个空间里嵌入的二进制总量
+    max_files_per_space: int = 0       # 单个空间的文件数量
+
+    def __post_init__(self) -> None:
+        self.max_text_bytes = max(0, int(self.max_text_bytes or 0))
+        self.max_binary_bytes = max(0, int(self.max_binary_bytes or 0))
+        self.max_space_binary_bytes = max(0, int(self.max_space_binary_bytes or 0))
+        self.max_files_per_space = max(0, int(self.max_files_per_space or 0))
+
+    @property
+    def unlimited(self) -> bool:
+        return not any(
+            (
+                self.max_text_bytes,
+                self.max_binary_bytes,
+                self.max_space_binary_bytes,
+                self.max_files_per_space,
+            )
+        )
+
+    @property
+    def summary(self) -> str:
+        if self.unlimited:
+            return "不限制"
+        bits = []
+        if self.max_text_bytes:
+            bits.append(f"文本 {human_bytes(self.max_text_bytes)}")
+        if self.max_binary_bytes:
+            bits.append(f"二进制 {human_bytes(self.max_binary_bytes)}")
+        if self.max_space_binary_bytes:
+            bits.append(f"空间二进制 {human_bytes(self.max_space_binary_bytes)}")
+        if self.max_files_per_space:
+            bits.append(f"{self.max_files_per_space} 个文件")
+        return " · ".join(bits)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_text_bytes": self.max_text_bytes,
+            "max_binary_bytes": self.max_binary_bytes,
+            "max_space_binary_bytes": self.max_space_binary_bytes,
+            "max_files_per_space": self.max_files_per_space,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "StorageLimits":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            max_text_bytes=int(data.get("max_text_bytes") or 0),
+            max_binary_bytes=int(data.get("max_binary_bytes") or 0),
+            max_space_binary_bytes=int(data.get("max_space_binary_bytes") or 0),
+            max_files_per_space=int(data.get("max_files_per_space") or 0),
+        )
+
+
+# 「如果库变慢了」可以一键套用的推荐值 (不是默认值!)
+SUGGESTED_LIMITS = StorageLimits(
+    max_text_bytes=2 * 1024 * 1024,
+    max_binary_bytes=4 * 1024 * 1024,
+    max_space_binary_bytes=32 * 1024 * 1024,
+    max_files_per_space=2000,
+)
+
+# 历史遗留的名字: 现在只是"推荐值"的别名, 不再用于强制拦截
+MAX_FILE_BYTES = SUGGESTED_LIMITS.max_text_bytes
+MAX_BINARY_BYTES = SUGGESTED_LIMITS.max_binary_bytes
+MAX_SPACE_BINARY_BYTES = SUGGESTED_LIMITS.max_space_binary_bytes
+MAX_FILES_PER_SPACE = SUGGESTED_LIMITS.max_files_per_space
 
 # 导入整个目录时**默认跳过**的目录名 (可以在对话框里勾上"全部包含")
 VCS_DIR_NAMES = frozenset({".git", ".svn", ".hg", ".bzr", "CVS"})
@@ -90,7 +184,7 @@ def is_image_path(path: str) -> bool:
     return name.rsplit(".", 1)[-1].lower() in IMAGE_EXTENSIONS
 
 
-def looks_binary(data: bytes) -> bool:
+def looks_binary(data: bytes, *, truncated: bool = False) -> bool:
     """按**内容**判断一段字节是不是二进制。
 
     扩展名不可靠 (``.dat`` / 无扩展名的可执行文件), 所以导入外部文件时还要看内容:
@@ -100,16 +194,21 @@ def looks_binary(data: bytes) -> bool:
 
     这条规则对中国用户很重要 —— 不能简单地按"非 ASCII 字节比例"判断, 那样
     一个纯中文的 README 会被误判成二进制。
+
+    ``truncated=True`` 表示 ``data`` 只是文件开头的一段 (扫描阶段只读前 1 KB)。
+    这时如果解码错误发生在**最后几个字节**, 那只是多字节字符被切断, 不算二进制。
     """
     if not data:
         return False
-    if b"\x00" in data[:8192]:
+    if b"\x00" in data:
         return True
     try:
         data.decode("utf-8")
-    except UnicodeDecodeError:
+        return False
+    except UnicodeDecodeError as exc:
+        if truncated and exc.start >= len(data) - 4:
+            return False
         return True
-    return False
 
 
 def decode_text(data: bytes) -> Optional[str]:
@@ -175,8 +274,9 @@ class ImportOptions:
     include_caches: bool = False         # 包含 __pycache__ / node_modules / .venv …
     keep_structure: bool = True          # 保留子目录结构 (否则全部平铺到根)
     target_dir: str = ""                 # 全部落到空间里的哪个目录下
-    max_text_bytes: int = MAX_FILE_BYTES
-    max_binary_bytes: int = MAX_BINARY_BYTES
+    # 0 = 不限制 (默认)。非 0 时超限的文件会被跳过并写明原因。
+    max_text_bytes: int = 0
+    max_binary_bytes: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -189,6 +289,19 @@ class ImportOptions:
             "max_text_bytes": self.max_text_bytes,
             "max_binary_bytes": self.max_binary_bytes,
         }
+
+    @classmethod
+    def from_limits(
+        cls, limits: "StorageLimits", **overrides: Any
+    ) -> "ImportOptions":
+        """从代码库的存储限制生成导入选项 (限制为 0 时就是不限制)。"""
+        options = cls(
+            max_text_bytes=limits.max_text_bytes,
+            max_binary_bytes=limits.max_binary_bytes,
+        )
+        for key, value in overrides.items():
+            setattr(options, key, value)
+        return options
 
 
 @dataclass
@@ -394,20 +507,20 @@ def _plan_one(
         return PlannedFile(source=source, path=path, size=size, reason=f"缓存/临时文件 ({suffix})")
 
     head = _read_head(source)
-    binary = is_binary_path(path) or looks_binary(head)
+    binary = is_binary_path(path) or looks_binary(head, truncated=True)
 
     if binary:
-        if size > opts.max_binary_bytes:
+        if opts.max_binary_bytes and size > opts.max_binary_bytes:
             return PlannedFile(
                 source=source, path=path, size=size, binary=True,
                 reason=f"超过二进制上限 {human_bytes(opts.max_binary_bytes)}",
             )
         return PlannedFile(source=source, path=path, size=size, binary=True)
 
-    if size > opts.max_text_bytes:
-        # 大文本文件改按二进制嵌入 —— 反正界面里也是只读预览,
+    if opts.max_text_bytes and size > opts.max_text_bytes:
+        # 设了文本上限时, 大文本改按二进制嵌入 —— 反正界面里也是只读预览,
         # 这样"完全打包"就不会因为一个 3 MB 的日志文件而失败。
-        if size <= opts.max_binary_bytes:
+        if not opts.max_binary_bytes or size <= opts.max_binary_bytes:
             return PlannedFile(source=source, path=path, size=size, binary=True)
         return PlannedFile(
             source=source, path=path, size=size,
@@ -430,7 +543,12 @@ def _relative_under(source: str, root: str, opts: ImportOptions) -> str:
     return relative.replace(os.sep, "/")
 
 
-def _read_head(source: str, limit: int = 8192) -> bytes:
+def _read_head(source: str, limit: int = 1024) -> bytes:
+    """只读开头一小段用于判断文本/二进制。
+
+    1 KB 足够看出有没有 ``NUL`` 和能不能按 UTF-8 解码, 而读取成本只有 8 KB 的
+    1/7 —— 扫几千个文件时这个差别很明显 (尤其是刚写完、还冷着的文件)。
+    """
     try:
         with open(source, "rb") as handle:
             return handle.read(limit)
@@ -826,14 +944,33 @@ class Space:
         """全部已嵌入二进制的原始字节总数 (不含 base64 放大)。"""
         return sum(item.size for item in self.embedded_binary_files)
 
-    def binary_budget_left(self, *, exclude_path: str = "") -> int:
-        """还能再嵌入多少字节的二进制 (``exclude_path`` 用于覆盖已有文件的场景)。"""
+    def binary_budget_left(
+        self, limit: int = 0, *, exclude_path: str = ""
+    ) -> int:
+        """还能再嵌入多少字节的二进制。
+
+        ``limit`` 为 0 (默认) 表示**不限制**, 此时返回 ``None`` 语义的大数 ——
+        调用方用 :meth:`binary_over_budget` 判断更清楚。
+        """
         used = sum(
             item.size
             for item in self.files
             if item.binary and item.data and item.path != normalize_project_path(exclude_path)
         )
-        return max(0, MAX_SPACE_BINARY_BYTES - used)
+        if not limit:
+            return -1                       # -1 = 不限制
+        return max(0, limit - used)
+
+    def binary_over_budget(self, incoming: int, limit: int = 0, *, exclude_path: str = "") -> bool:
+        """再嵌入 ``incoming`` 字节会不会超过 ``limit`` (limit=0 恒为 False)。"""
+        if not limit:
+            return False
+        used = sum(
+            item.size
+            for item in self.files
+            if item.binary and item.data and item.path != normalize_project_path(exclude_path)
+        )
+        return used + incoming > limit
 
     @property
     def search_blob(self) -> str:
@@ -1078,6 +1215,8 @@ __all__ = [
     "ImportOptions",
     "PlannedFile",
     "DirectoryScan",
+    "StorageLimits",
+    "SUGGESTED_LIMITS",
     "scan_external_directory",
     "build_tree",
     "search_readmes",

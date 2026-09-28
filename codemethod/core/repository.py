@@ -34,14 +34,11 @@ from .models import (
     utcnow,
 )
 from .spaces import (
-    MAX_BINARY_BYTES,
-    MAX_FILES_PER_SPACE,
-    MAX_FILE_BYTES,
-    MAX_SPACE_BINARY_BYTES,
     DirectoryScan,
     ImportOptions,
     ProjectFile,
     Space,
+    StorageLimits,
     decode_text,
     human_bytes,
     is_binary_path,
@@ -186,8 +183,20 @@ class Repository:
         self.extra: Dict[str, Any] = {}
         self.path: Optional[str] = None
         self.dirty: bool = False
+        # 存储限制: **默认全部不限制**, 用户可以自己去「存储限制…」里设
+        self.limits: StorageLimits = StorageLimits()
         self._search_cache: Dict[Tuple[str, int, bool], str] = {}
+        self._search_cache_chars: int = 0
         self._tag_counter: int = 0
+
+    # ==================================================================================
+    # 存储限制
+    # ==================================================================================
+    def set_limits(self, limits: StorageLimits) -> StorageLimits:
+        """设置存储限制 (0 = 不限制)。改完立刻生效, 不影响已有内容。"""
+        self.limits = limits if isinstance(limits, StorageLimits) else StorageLimits()
+        self._touch()
+        return self.limits
 
     # ==================================================================================
     # 条目
@@ -960,11 +969,10 @@ class Repository:
     ) -> ProjectFile:
         """新增或覆盖空间里的一个文件。
 
-        * 文本内容超过 :data:`MAX_FILE_BYTES` 会被拒绝;
-        * 传 ``binary_data`` 时把**原始字节直接嵌进库里** (base64 存进 ``data``),
-          上限 :data:`MAX_BINARY_BYTES`, 且整个空间最多嵌入
-          :data:`MAX_SPACE_BINARY_BYTES`;
-        * 只传 ``binary=True`` / ``size`` 时保持旧行为: 仅记录大小, 不保存内容。
+        * 传 ``binary_data`` 时把**原始字节直接嵌进库里** (base64 存进 ``data``);
+        * 只传 ``binary=True`` / ``size`` 时保持旧行为: 仅记录大小, 不保存内容;
+        * 大小/数量**默认不限制** —— 只有在 :attr:`limits` 里设了非 0 值时才拦截,
+          而且报错信息会告诉你怎么去关掉它。
         """
         space = self.require_space(space_id)
         normalized = normalize_project_path(path)
@@ -974,21 +982,7 @@ class Repository:
         is_binary = binary or is_binary_path(normalized) or binary_data is not None
         if binary_data is not None:
             payload = bytes(binary_data)
-            if len(payload) > MAX_BINARY_BYTES:
-                raise RepositoryError(
-                    f"{normalized} 有 {human_bytes(len(payload))}, 超过单个二进制文件的上限 "
-                    f"{human_bytes(MAX_BINARY_BYTES)}"
-                )
-            if not is_binary_path(normalized):
-                # 扩展名不像二进制, 但内容也不像文本 —— 仍然按二进制嵌进去
-                pass
-            left = space.binary_budget_left(exclude_path=normalized)
-            if len(payload) > left:
-                raise RepositoryError(
-                    f"空间里已嵌入的二进制接近上限: 这个文件需要 "
-                    f"{human_bytes(len(payload))}, 但只剩 {human_bytes(left)} "
-                    f"(单空间上限 {human_bytes(MAX_SPACE_BINARY_BYTES)})"
-                )
+            self._check_binary_limits(space, normalized, len(payload))
             file = ProjectFile(path=normalized, binary=True, note=note)
             file.set_bytes(payload)
         elif is_binary:
@@ -996,15 +990,11 @@ class Repository:
                 path=normalized, content="", binary=True, size=max(0, int(size)), note=note
             )
         else:
-            if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-                raise RepositoryError(
-                    f"文件过大 ({len(content.encode('utf-8'))} 字节), 上限 {MAX_FILE_BYTES} 字节"
-                )
+            self._check_text_limits(normalized, len(content.encode("utf-8")))
             file = ProjectFile(path=normalized, content=content, note=note)
 
         existing = space.get_file(normalized)
-        if existing is None and len(space.files) >= MAX_FILES_PER_SPACE:
-            raise RepositoryError(f"单个空间的文件数上限为 {MAX_FILES_PER_SPACE}")
+        self._check_file_count(space, adding=existing is None)
 
         old_size = existing.computed_size if existing is not None else 0
         space.put_file(file)
@@ -1017,6 +1007,40 @@ class Repository:
         )
         self._space_file_change(space, action, detail, author=author)
         return file
+
+    # ---- 限制检查 (全部只在设了非 0 值时生效) ----
+    LIMIT_HINT = "（可以去「文件 → 存储限制…」把这一项设为不限制）"
+
+    def _check_text_limits(self, path: str, size: int) -> None:
+        limit = self.limits.max_text_bytes
+        if limit and size > limit:
+            raise RepositoryError(
+                f"{path} 有 {human_bytes(size)}, 超过当前文本文件上限 "
+                f"{human_bytes(limit)}" + self.LIMIT_HINT
+            )
+
+    def _check_binary_limits(self, space: Space, path: str, size: int) -> None:
+        limit = self.limits.max_binary_bytes
+        if limit and size > limit:
+            raise RepositoryError(
+                f"{path} 有 {human_bytes(size)}, 超过当前二进制文件上限 "
+                f"{human_bytes(limit)}" + self.LIMIT_HINT
+            )
+        total = self.limits.max_space_binary_bytes
+        if total and space.binary_over_budget(size, total, exclude_path=path):
+            left = space.binary_budget_left(total, exclude_path=path)
+            raise RepositoryError(
+                f"空间里已嵌入的二进制接近上限: 这个文件需要 {human_bytes(size)}, "
+                f"但只剩 {human_bytes(left)} (当前单空间上限 {human_bytes(total)})"
+                + self.LIMIT_HINT
+            )
+
+    def _check_file_count(self, space: Space, *, adding: bool) -> None:
+        limit = self.limits.max_files_per_space
+        if adding and limit and len(space.files) >= limit:
+            raise RepositoryError(
+                f"单个空间的文件数已达上限 {limit}" + self.LIMIT_HINT
+            )
 
     # ---- 导入外部文件 (内容直接嵌入 .cmdb, 不是引用) ----
     def import_external_files(
@@ -1041,7 +1065,8 @@ class Repository:
         report = ImportReport()
         created: List[ProjectFile] = []
         before = take_snapshot(space)
-        remaining_budget = space.binary_budget_left()
+        limit_bytes = self.limits.max_space_binary_bytes
+        remaining_budget = space.binary_budget_left(limit_bytes)
         # 已选路径先占位, 免得同一批里两个文件把预算算重
         reserved: Dict[str, int] = {}
 
@@ -1060,8 +1085,14 @@ class Repository:
                 continue
 
             existing = space.get_file(normalized)
-            if existing is None and len(space.files) + len(created) >= MAX_FILES_PER_SPACE:
-                report.skipped.append((normalized, f"超过单空间 {MAX_FILES_PER_SPACE} 个文件的上限"))
+            if (
+                existing is None
+                and self.limits.max_files_per_space
+                and len(space.files) + len(created) >= self.limits.max_files_per_space
+            ):
+                report.skipped.append(
+                    (normalized, f"超过单空间 {self.limits.max_files_per_space} 个文件的上限")
+                )
                 continue
 
             try:
@@ -1075,17 +1106,20 @@ class Repository:
             binary = by_extension or looks_binary(raw)
 
             if binary:
-                if len(raw) > MAX_BINARY_BYTES:
+                if self.limits.max_binary_bytes and len(raw) > self.limits.max_binary_bytes:
                     report.skipped.append(
-                        (normalized, f"{human_bytes(len(raw))} 超过单文件上限 {human_bytes(MAX_BINARY_BYTES)}")
+                        (normalized, f"{human_bytes(len(raw))} 超过单文件上限 "
+                                     f"{human_bytes(self.limits.max_binary_bytes)}")
                     )
                     continue
-                budget = remaining_budget - reserved.get(normalized, 0)
-                if len(raw) > budget:
-                    report.skipped.append(
-                        (normalized, f"空间二进制余量不足 (还需 {human_bytes(len(raw))}, 只剩 {human_bytes(budget)})")
-                    )
-                    continue
+                if limit_bytes:
+                    budget = remaining_budget - reserved.get(normalized, 0)
+                    if len(raw) > budget:
+                        report.skipped.append(
+                            (normalized, f"空间二进制余量不足 (还需 {human_bytes(len(raw))}, "
+                                         f"只剩 {human_bytes(budget)})")
+                        )
+                        continue
                 reserved[normalized] = reserved.get(normalized, 0) + len(raw)
                 file = ProjectFile(path=normalized, binary=True)
                 file.set_bytes(raw)
@@ -1094,9 +1128,10 @@ class Repository:
                 if body is None:      # pragma: no cover - looks_binary 已拦下
                     report.skipped.append((normalized, "既不是合法 UTF-8 也不是二进制"))
                     continue
-                if len(raw) > MAX_FILE_BYTES:
+                if self.limits.max_text_bytes and len(raw) > self.limits.max_text_bytes:
                     report.skipped.append(
-                        (normalized, f"{human_bytes(len(raw))} 超过单文件上限 {human_bytes(MAX_FILE_BYTES)}")
+                        (normalized, f"{human_bytes(len(raw))} 超过文本文件上限 "
+                                     f"{human_bytes(self.limits.max_text_bytes)}")
                     )
                     continue
                 file = ProjectFile(path=normalized, content=body)
@@ -1181,12 +1216,15 @@ class Repository:
         planned = scan.included
 
         total_binary = sum(item.size for item in planned if item.binary)
-        left = space.binary_budget_left()
-        if total_binary > left and not force:
+        limit = self.limits.max_space_binary_bytes
+        over_budget = bool(limit) and space.binary_over_budget(total_binary, limit)
+        if over_budget and not force:
+            left = space.binary_budget_left(limit)
             raise RepositoryError(
                 f"这次要嵌入 {human_bytes(total_binary)} 的二进制内容, 但空间只剩 "
-                f"{human_bytes(left)} (单空间软上限 {human_bytes(MAX_SPACE_BINARY_BYTES)})。\n"
+                f"{human_bytes(left)} (当前单空间上限 {human_bytes(limit)})。\n"
                 "可以少选一些文件, 或在导入对话框里勾上「仍然导入」。"
+                + self.LIMIT_HINT
             )
 
         existing_paths = {item.path for item in space.files}
@@ -1194,9 +1232,13 @@ class Repository:
         before = take_snapshot(space)
 
         for item in planned:
-            if item.path not in existing_paths and len(space.files) + len(created) >= MAX_FILES_PER_SPACE:
+            if (
+                item.path not in existing_paths
+                and self.limits.max_files_per_space
+                and len(space.files) + len(created) >= self.limits.max_files_per_space
+            ):
                 report.skipped.append(
-                    (item.path, f"超过单空间 {MAX_FILES_PER_SPACE} 个文件的上限")
+                    (item.path, f"超过单空间 {self.limits.max_files_per_space} 个文件的上限")
                 )
                 continue
             try:
@@ -1245,8 +1287,8 @@ class Repository:
             )
             if scan.skipped:
                 detail += f"; 跳过 {len(scan.skipped)} 个"
-            if force and total_binary > left:
-                detail += "（已超出空间软上限, 手动确认）"
+            if force and over_budget:
+                detail += "（已超出你在「存储限制」里设的上限, 手动确认）"
             self._space_file_change(space, "file_add", detail, author=author)
         return report
 
@@ -1346,14 +1388,19 @@ class Repository:
             try:
                 if isinstance(content, (bytes, bytearray)):
                     payload = bytes(content)
-                    if len(payload) > MAX_BINARY_BYTES:
+                    if self.limits.max_binary_bytes and len(payload) > self.limits.max_binary_bytes:
                         continue
-                    if len(payload) > space.binary_budget_left(exclude_path=normalized):
+                    if space.binary_over_budget(
+                        len(payload), self.limits.max_space_binary_bytes, exclude_path=normalized
+                    ):
                         continue
                     file = ProjectFile(path=normalized, binary=True)
                     file.set_bytes(payload)
                 else:
                     if is_binary_path(normalized):
+                        continue
+                    size = len(str(content).encode("utf-8"))
+                    if self.limits.max_text_bytes and size > self.limits.max_text_bytes:
                         continue
                     file = ProjectFile(path=normalized, content=str(content))
                 space.put_file(file)
@@ -1974,14 +2021,42 @@ class Repository:
                 out.append((entry, impl))
         return out
 
+    # 全文检索索引的缓存预算 (字符数)。索引是"把每个文件内容 casefold 一份"留在内存里,
+    # 库特别大时会成倍占用 —— 所以给总量设个预算, 超了先淘汰最大的那几条。
+    # 注意: 这**不影响检索的正确性**, 只是让超大条目每次重新算一遍。
+    SEARCH_CACHE_BUDGET = 48 * 1024 * 1024
+
     def search_text(self, entity: Any) -> str:
         key = (entity.id, entity.version, entity.deleted)
         cached = self._search_cache.get(key)
         if cached is None:
             cached = entity.search_blob
-            self._search_cache = {k: v for k, v in self._search_cache.items() if k[0] != entity.id}
+            self._evict_search_cache(entity.id)
             self._search_cache[key] = cached
+            self._search_cache_chars += len(cached)
+            self._trim_search_cache()
         return cached
+
+    def _evict_search_cache(self, entity_id: str) -> None:
+        """丢掉这个对象的旧版本索引 (并同步预算计数)。"""
+        stale = [k for k in self._search_cache if k[0] == entity_id]
+        for key in stale:
+            self._search_cache_chars -= len(self._search_cache.pop(key))
+
+    def _trim_search_cache(self) -> None:
+        """索引总量超过预算时, 从最大的开始淘汰, 直到回到预算内。"""
+        if self._search_cache_chars <= self.SEARCH_CACHE_BUDGET:
+            return
+        ordered = sorted(self._search_cache.items(), key=lambda kv: -len(kv[1]))
+        for key, blob in ordered:
+            if self._search_cache_chars <= self.SEARCH_CACHE_BUDGET:
+                break
+            self._search_cache.pop(key, None)
+            self._search_cache_chars -= len(blob)
+
+    def clear_search_cache(self) -> None:
+        self._search_cache.clear()
+        self._search_cache_chars = 0
 
     def language_usage(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -2045,6 +2120,8 @@ class Repository:
             "symbols_missing_meaning": sum(
                 len(f.symbols_missing_meaning) for f in functions
             ),
+            "limits": self.limits.to_dict(),
+            "limits_summary": self.limits.summary,
             "created_at": self.created_at,
             "modified_at": self.modified_at,
         }
@@ -2078,6 +2155,8 @@ class Repository:
             # 三类实体同处一个容器: 旧版本读到多余键会忽略, 新版本缺键则当作空
             "spaces": [space.to_dict() for space in self.spaces.values()],
             "functions": [func.to_dict() for func in self.functions.values()],
+            # 存储限制跟着库走: 默认全 0 (不限制)
+            "limits": self.limits.to_dict(),
             "extra": dict(self.extra),
         }
         if include_history:
@@ -2095,6 +2174,8 @@ class Repository:
         repo.created_at = float(data.get("created_at") or utcnow())
         repo.modified_at = float(data.get("modified_at") or repo.created_at)
         repo.extra = dict(data.get("extra") or {})
+        # 旧文件没有 limits 键 → 默认不限制 (正是我们想要的默认行为)
+        repo.limits = StorageLimits.from_dict(data.get("limits"))
 
         for item in data.get("entries") or []:
             if not isinstance(item, dict):
