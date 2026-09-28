@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import posixpath
 import time
 from dataclasses import dataclass, field
@@ -33,7 +36,7 @@ README_NAMES = frozenset(
     {"readme", "readme.md", "readme.rst", "readme.txt", "readme.markdown"}
 )
 
-# 二进制/不可编辑的扩展名: 只记录大小, 不保存内容
+# 二进制/不可编辑的扩展名: 默认按二进制处理
 BINARY_EXTENSIONS = frozenset(
     {
         "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "pdf", "zip", "gz", "bz2",
@@ -43,8 +46,16 @@ BINARY_EXTENSIONS = frozenset(
     }
 )
 
-MAX_FILE_BYTES = 2 * 1024 * 1024      # 单文件内容上限, 防止库被巨型文件撑爆
+# 可以直接在界面里预览的图片类型
+IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"})
+
+MAX_FILE_BYTES = 2 * 1024 * 1024      # 单文件文本内容上限, 防止库被巨型文件撑爆
+MAX_BINARY_BYTES = 4 * 1024 * 1024    # 单个二进制文件的嵌入上限
+MAX_SPACE_BINARY_BYTES = 32 * 1024 * 1024   # 单个空间里全部嵌入二进制的总量上限
 MAX_FILES_PER_SPACE = 2000
+
+# 十六进制预览一次取多少字节
+HEX_PREVIEW_BYTES = 512
 
 
 def is_binary_path(path: str) -> bool:
@@ -52,6 +63,73 @@ def is_binary_path(path: str) -> bool:
     if "." not in name:
         return False
     return name.rsplit(".", 1)[-1].lower() in BINARY_EXTENSIONS
+
+
+def is_image_path(path: str) -> bool:
+    name = posixpath.basename(path or "")
+    if "." not in name:
+        return False
+    return name.rsplit(".", 1)[-1].lower() in IMAGE_EXTENSIONS
+
+
+def looks_binary(data: bytes) -> bool:
+    """按**内容**判断一段字节是不是二进制。
+
+    扩展名不可靠 (``.dat`` / 无扩展名的可执行文件), 所以导入外部文件时还要看内容:
+
+    * 出现 ``NUL`` 字节 → 二进制 (文本文件不会有);
+    * 否则尝试按 UTF-8 解码, 解不开 → 二进制。
+
+    这条规则对中国用户很重要 —— 不能简单地按"非 ASCII 字节比例"判断, 那样
+    一个纯中文的 README 会被误判成二进制。
+    """
+    if not data:
+        return False
+    if b"\x00" in data[:8192]:
+        return True
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def decode_text(data: bytes) -> Optional[str]:
+    """能当文本读就返回文本, 否则返回 ``None``。"""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def human_bytes(size: int) -> str:
+    """``1536`` → ``1.5 KB``。"""
+    value = float(max(0, int(size)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def hex_dump(data: bytes, *, limit: int = HEX_PREVIEW_BYTES, base_offset: int = 0) -> str:
+    """生成 ``offset  hex  |ascii|`` 形式的十六进制预览。"""
+    lines: List[str] = []
+    chunk = data[: max(0, int(limit))]
+    for offset in range(0, len(chunk), 16):
+        block = chunk[offset: offset + 16]
+        hex_part = " ".join(f"{byte:02X}" for byte in block)
+        hex_part = f"{hex_part:<47}"
+        text = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in block)
+        lines.append(f"{base_offset + offset:08X}  {hex_part}  |{text}|")
+    if len(data) > len(chunk):
+        lines.append(
+            f"… 还有 {human_bytes(len(data) - len(chunk))} 未显示 "
+            f"(共 {human_bytes(len(data))})"
+        )
+    return "\n".join(lines)
 
 
 def normalize_project_path(path: str) -> str:
@@ -86,14 +164,22 @@ def is_readme_path(path: str) -> bool:
 
 @dataclass
 class ProjectFile:
-    """空间里的一个文件。"""
+    """空间里的一个文件。
+
+    文本文件把内容放在 ``content``; 二进制文件把**原始字节的 base64** 放在 ``data`` ——
+    也就是说内容真的被**嵌进了 ``.cmdb``**, 不是对外部路径的引用。
+
+    旧版本保存的二进制文件只有 ``size`` 没有 ``data`` (只记大小), 仍然能正常打开,
+    界面会显示成"未嵌入"并允许重新导入。
+    """
 
     path: str = ""
     content: str = ""
     language: str = "plaintext"
-    binary: bool = False          # 二进制文件只记录大小, content 为空
+    binary: bool = False          # 二进制文件的内容以 base64 存在 data 里
     size: int = 0
     note: str = ""
+    data: str = ""                # base64(原始字节); 空 = 未嵌入内容
     created_at: float = field(default_factory=utcnow)
     updated_at: float = field(default_factory=utcnow)
 
@@ -128,11 +214,32 @@ class ProjectFile:
         return is_readme_path(self.path)
 
     @property
+    def is_image(self) -> bool:
+        return self.binary and self.extension in IMAGE_EXTENSIONS
+
+    @property
+    def has_data(self) -> bool:
+        """二进制内容是否真的被嵌进了库里。"""
+        return bool(self.data)
+
+    @property
+    def embedded(self) -> bool:
+        """内容是否存在库内 (文本文件总是嵌入的)。"""
+        return True if not self.binary else bool(self.data)
+
+    @property
     def computed_size(self) -> int:
         """字节数 (UTF-8)。语言占比按这个口径统计, 与 GitHub 一致。"""
         if self.binary:
             return int(self.size)
         return len(self.content.encode("utf-8"))
+
+    @property
+    def stored_bytes(self) -> int:
+        """这个文件在容器里大致占多少字节 (base64 会放大 1/3)。"""
+        if self.binary:
+            return len(self.data.encode("ascii")) if self.data else 0
+        return self.computed_size
 
     @property
     def line_count(self) -> int:
@@ -143,6 +250,50 @@ class ProjectFile:
     @property
     def category(self) -> str:
         return get_language(self.language).category
+
+    @property
+    def size_label(self) -> str:
+        return human_bytes(self.computed_size)
+
+    # ---- 二进制内容 ----
+    def set_bytes(self, raw: bytes, *, note: Optional[str] = None) -> None:
+        """把原始字节嵌进这个文件 (base64 存进 ``data``)。"""
+        payload = bytes(raw)
+        self.binary = True
+        self.content = ""
+        self.language = "plaintext"
+        self.data = base64.b64encode(payload).decode("ascii")
+        self.size = len(payload)
+        if note is not None:
+            self.note = note
+
+    def raw_bytes(self) -> bytes:
+        """解出嵌入的原始字节; 未嵌入或数据损坏时返回 ``b""``。"""
+        if not self.data:
+            return b""
+        try:
+            return base64.b64decode(self.data, validate=False)
+        except (binascii.Error, ValueError):  # pragma: no cover - 只可能是被手工改坏
+            return b""
+
+    def sha256(self) -> str:
+        raw = self.raw_bytes()
+        return hashlib.sha256(raw).hexdigest() if raw else ""
+
+    def hex_preview(self, *, limit: int = HEX_PREVIEW_BYTES) -> str:
+        return hex_dump(self.raw_bytes(), limit=limit)
+
+    def write_to(self, target: str) -> int:
+        """把文件内容写到磁盘 (二进制按原始字节, 文本按 UTF-8), 返回字节数。"""
+        if self.binary:
+            raw = self.raw_bytes()
+            with open(target, "wb") as handle:
+                handle.write(raw)
+            return len(raw)
+        body = self.content.encode("utf-8")
+        with open(target, "wb") as handle:
+            handle.write(body)
+        return len(body)
 
     def touch(self) -> None:
         self.updated_at = utcnow()
@@ -157,6 +308,7 @@ class ProjectFile:
             "binary": self.binary,
             "size": self.size,
             "note": self.note,
+            "data": self.data,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -171,6 +323,7 @@ class ProjectFile:
             binary=binary,
             size=int(data.get("size") or 0),
             note=str(data.get("note") or ""),
+            data=str(data.get("data") or ""),
             created_at=float(data.get("created_at") or utcnow()),
             updated_at=float(data.get("updated_at") or utcnow()),
         )
@@ -237,6 +390,8 @@ class TreeNode:
     is_dir: bool
     size: int = 0
     language: str = ""
+    binary: bool = False
+    embedded: bool = True       # 二进制文件是否把内容嵌进了库
     children: List["TreeNode"] = field(default_factory=list)
 
     def sorted_children(self) -> List["TreeNode"]:
@@ -274,6 +429,8 @@ def build_tree(files: Iterable[ProjectFile]) -> TreeNode:
             is_dir=False,
             size=item.computed_size,
             language=item.language,
+            binary=item.binary,
+            embedded=item.embedded,
         )
         directory.children.append(node)
     return root
@@ -348,6 +505,29 @@ class Space:
     @property
     def total_size(self) -> int:
         return sum(item.computed_size for item in self.files)
+
+    @property
+    def binary_files(self) -> List[ProjectFile]:
+        return [item for item in self.files if item.binary]
+
+    @property
+    def embedded_binary_files(self) -> List[ProjectFile]:
+        """内容真的被嵌进库里的二进制文件。"""
+        return [item for item in self.files if item.binary and item.data]
+
+    @property
+    def embedded_binary_bytes(self) -> int:
+        """全部已嵌入二进制的原始字节总数 (不含 base64 放大)。"""
+        return sum(item.size for item in self.embedded_binary_files)
+
+    def binary_budget_left(self, *, exclude_path: str = "") -> int:
+        """还能再嵌入多少字节的二进制 (``exclude_path`` 用于覆盖已有文件的场景)。"""
+        used = sum(
+            item.size
+            for item in self.files
+            if item.binary and item.data and item.path != normalize_project_path(exclude_path)
+        )
+        return max(0, MAX_SPACE_BINARY_BYTES - used)
 
     @property
     def search_blob(self) -> str:
@@ -594,8 +774,17 @@ __all__ = [
     "normalize_project_path",
     "is_readme_path",
     "is_binary_path",
+    "is_image_path",
+    "looks_binary",
+    "decode_text",
+    "hex_dump",
+    "human_bytes",
     "README_NAMES",
     "BINARY_EXTENSIONS",
+    "IMAGE_EXTENSIONS",
     "MAX_FILE_BYTES",
+    "MAX_BINARY_BYTES",
+    "MAX_SPACE_BINARY_BYTES",
     "MAX_FILES_PER_SPACE",
+    "HEX_PREVIEW_BYTES",
 ]

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import sys
 from typing import List, Optional, Sequence
@@ -20,6 +21,12 @@ from .storage.database import Database, DatabaseError
 from .ui.main_window import MainWindow
 from .ui.resources import app_icon
 from .ui.theme import DEFAULT_THEME, apply_theme, get_theme
+
+# 一个合法的 1×1 透明 PNG (67 字节) —— 演示"把外部二进制嵌进代码库"
+DEMO_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+    "hKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def build_demo_repository() -> Repository:
@@ -395,6 +402,10 @@ class TestTokenizer(unittest.TestCase):
     for path, content in space_files:
         repo.put_space_file(space.id, path, content)
 
+    # 二进制文件也是**嵌进库里**的 (base64), 拷走一个 .cmdb 就能完整还原。
+    # 这里放一个真实的 1×1 PNG, 用来演示图片预览与"导出到磁盘"。
+    repo.put_space_file(space.id, "docs/logo.png", binary_data=DEMO_PNG)
+
     # ---- 函数体: 自动检测变量并要求填写含义 (同一个函数可以有多语言实现) ----
     function = repo.create_function(
         "mod_pow",
@@ -545,6 +556,12 @@ def run_self_test(report_path: Optional[str] = None) -> int:
 
     lines: List[str] = []
     failures: List[str] = []
+
+    def archive_bytes(path: str, member: str) -> bytes:
+        import zipfile
+
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(member)
 
     def check(name: str, condition: bool, detail: str = "") -> None:
         lines.append(f"[{'PASS' if condition else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
@@ -716,6 +733,16 @@ def run_self_test(report_path: Optional[str] = None) -> int:
                 len(nested) >= len(sample_space.files),
                 f"{len(nested)} 个文件按原路径还原",
             )
+            # 嵌入的二进制在 ZIP 里必须是**原始字节**, 而不是占位说明
+            embedded = sample_space.embedded_binary_files
+            if embedded:
+                target = embedded[0]
+                hit = [n for n in names if n.endswith(target.path)]
+                check(
+                    "ZIP 里二进制还原成原始字节",
+                    bool(hit) and archive_bytes(zp, hit[0]) == target.raw_bytes(),
+                    f"{target.path} · {len(target.raw_bytes())} 字节",
+                )
 
         # 4) 界面构建 (offscreen, 覆盖 Qt 插件是否被正确打包)
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -734,6 +761,32 @@ def run_self_test(report_path: Optional[str] = None) -> int:
         rows = window.entry_list.entry_model.rowCount()
         expected_rows = stats["modules"] + stats["spaces"] + stats["functions"]
         check("主窗口构建", rows == expected_rows, f"列表 {rows} 行 / 期望 {expected_rows}")
+
+        # ---- 对话框必须放得进屏幕 (否则底部的「保存」会跑到屏幕外) ----
+        from .ui.layout_util import SCREEN_MARGIN, available_geometry, clamp_size
+
+        rect = available_geometry(window)
+        if rect is None:
+            check("取得屏幕可用区域", False, "拿不到屏幕信息")
+        else:
+            width, height = clamp_size(4000, 3000)
+            check(
+                "超大对话框会被夹到屏幕内",
+                width <= int(rect.width() * SCREEN_MARGIN) + 1
+                and height <= int(rect.height() * SCREEN_MARGIN) + 1,
+                f"屏幕 {rect.width()}×{rect.height()} → 夹到 {width}×{height}",
+            )
+            check(
+                "小尺寸对话框不被放大",
+                clamp_size(600, 400) == (600, 400),
+            )
+            # 主窗口自己也不能超出屏幕 —— 否则它下面的对话框会跟着沉到屏幕外
+            frame = window.frameGeometry()
+            check(
+                "主窗口完整落在屏幕可用区域内",
+                rect.contains(frame),
+                f"窗口 {frame.width()}×{frame.height()} / 屏幕 {rect.width()}×{rect.height()}",
+            )
 
         # ---- 模块: 多语言页签 ----
         target = next(
@@ -792,6 +845,32 @@ def run_self_test(report_path: Optional[str] = None) -> int:
                 len(window.space_panel.language_bar._shares) > 0,
                 ui_space.language_summary(),
             )
+            # 嵌入的二进制文件: 内容在库里 + 有专门的预览页
+            embedded = ui_space.embedded_binary_files
+            check(
+                "二进制文件已嵌入库内",
+                bool(embedded) and all(f.raw_bytes() for f in embedded),
+                "、".join(f"{f.path} ({f.size}B)" for f in embedded) or "无",
+            )
+            if embedded:
+                binary_file = embedded[0]
+                check(
+                    "嵌入的字节与原始文件一致",
+                    binary_file.raw_bytes() == DEMO_PNG,
+                    f"{len(binary_file.raw_bytes())} 字节",
+                )
+                window.space_panel.show_file(binary_file.path)
+                for _ in range(3):
+                    app.processEvents()
+                check(
+                    "二进制预览页被激活",
+                    window.space_panel.tabs.currentIndex() == 2
+                    and window.space_panel.binary_preview.meta_label.text() != "",
+                    window.space_panel.binary_preview.meta_label.text(),
+                )
+                window.space_panel.show_file(sorted(
+                    f.path for f in ui_space.files if not f.binary
+                )[0])
 
         # ---- 函数体: 详情面板切到变量表 ----
         if ui_function is not None:

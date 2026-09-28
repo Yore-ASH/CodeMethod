@@ -50,7 +50,7 @@ class ReadmeSearchDialog(ThemedDialog):
         self._hits: List[ReadmeHit] = []
 
         self.setWindowTitle("README 检索")
-        self.setMinimumSize(880, 600)
+        self.setMinimumSize(720, 460)
         self.resize(1040, 700)
 
         root = QVBoxLayout(self)

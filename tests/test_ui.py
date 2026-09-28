@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import unittest
@@ -20,10 +21,19 @@ try:
     from codemethod.core.languages import LANGUAGES, all_languages
     from codemethod.core.models import Implementation
     from codemethod.core.repository import Repository
+    from codemethod.core.spaces import ProjectFile
     from codemethod.storage.database import Database
     from codemethod.ui.editor import CodeEditor, CodePreview, DiffView
     from codemethod.ui.highlighter import build_rules, highlighted_tokens
+    from codemethod.ui.layout_util import (
+        SCREEN_MARGIN,
+        clamp_size,
+        fit_dialog_to_screen,
+        fit_window_to_screen,
+    )
     from codemethod.ui.main_window import MainWindow
+    from codemethod.ui.dialogs.space_editor import SpaceEditorDialog
+    from codemethod.ui.widgets.binary_preview import BinaryPreview
     from codemethod.ui.theme import (
         DARK_PLUS,
         DEFAULT_THEME,
@@ -1243,6 +1253,302 @@ class TestNativeTitleBar(_TrackedWidgets):
         for key, theme in THEMES.items():
             apply_theme(self.app, get_theme(key))
             self.assertEqual(current_themer().theme.is_dark, theme.is_dark, key)
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestDialogFitsOnScreen(_TrackedWidgets):
+    """用户报的问题: 添加文件时弹出来的对话框太大, 底部的「保存」跑到屏幕外。"""
+
+    def test_clamp_size_shrinks_to_screen(self):
+        from PySide6.QtCore import QRect
+
+        small = QRect(0, 0, 800, 600)
+        width, height = clamp_size(1400, 900, geometry=small)
+        self.assertLessEqual(width, int(800 * SCREEN_MARGIN) + 1)
+        self.assertLessEqual(height, int(600 * SCREEN_MARGIN) + 1)
+
+    def test_clamp_size_keeps_small_sizes(self):
+        from PySide6.QtCore import QRect
+
+        big = QRect(0, 0, 2560, 1440)
+        self.assertEqual(clamp_size(900, 660, geometry=big), (900, 660))
+
+    def test_clamp_size_reserves_room_for_window_frame(self):
+        """可用高度要再扣掉标题栏/边框, 否则 frame 仍然会顶到屏幕外。"""
+        from PySide6.QtCore import QRect
+
+        from codemethod.ui.layout_util import FRAME_ALLOWANCE
+
+        screen = QRect(0, 0, 1536, 824)
+        _width, height = clamp_size(1400, 900, geometry=screen)
+        self.assertLessEqual(height, int(824 * SCREEN_MARGIN) - FRAME_ALLOWANCE + 1)
+        self.assertLessEqual(height + FRAME_ALLOWANCE, 824)
+
+    def test_oversized_dialog_gets_shrunk(self):
+        from PySide6.QtCore import QRect
+        from unittest import mock
+
+        import codemethod.ui.layout_util as layout_util
+
+        dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+        dialog.setMinimumSize(1400, 1000)
+        dialog.resize(1600, 1200)
+        with mock.patch.object(
+            layout_util, "available_geometry", return_value=QRect(0, 0, 1024, 640)
+        ):
+            changed = fit_dialog_to_screen(dialog)
+        self.assertTrue(changed)
+        self.assertLessEqual(dialog.width(), int(1024 * SCREEN_MARGIN) + 1)
+        self.assertLessEqual(dialog.height(), int(640 * SCREEN_MARGIN) + 1)
+        self.assertLessEqual(dialog.minimumHeight(), dialog.height())
+
+    def test_main_window_is_fitted_to_screen(self):
+        """主窗口 1440x900 比 1536x864 的可用高度还高, 必须被夹下来。
+
+        这个 bug 的连锁反应才是用户真正遇到的: 父窗口下沉 → 以它为中心弹出的
+        对话框跟着下沉 → 底部的「保存」跑到屏幕外。
+        """
+        from PySide6.QtCore import QRect
+        from unittest import mock
+
+        import codemethod.ui.layout_util as layout_util
+
+        db = Database.create()
+        window = self.track(MainWindow(db))
+        window.resize(1440, 900)
+        with mock.patch.object(
+            layout_util, "available_geometry", return_value=QRect(0, 0, 1536, 824)
+        ):
+            changed = fit_window_to_screen(window)
+        self.assertTrue(changed)
+        self.assertLessEqual(window.height(), 824)
+
+    def test_fit_window_leaves_room_for_taskbar(self):
+        from PySide6.QtCore import QRect
+        from unittest import mock
+
+        import codemethod.ui.layout_util as layout_util
+
+        db = Database.create()
+        window = self.track(MainWindow(db))
+        window.resize(1440, 900)
+        geometry = QRect(0, 0, 1536, 824)      # 已扣掉任务栏
+        with mock.patch.object(
+            layout_util, "available_geometry", return_value=geometry
+        ):
+            fit_window_to_screen(window)
+        self.assertLessEqual(window.size().height(), geometry.height())
+
+    def test_space_editor_minimum_is_modest(self):
+        """声明的最小尺寸不能超过常见小屏的可用高度, 否则夹也夹不下去。"""
+        dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+        self.assertLessEqual(dialog.minimumHeight(), 560)
+        self.assertLessEqual(dialog.minimumWidth(), 820)
+
+    def test_themed_dialog_fits_on_show(self):
+        from PySide6.QtCore import QRect
+        from unittest import mock
+
+        import codemethod.ui.layout_util as layout_util
+        from codemethod.ui.native import ThemedDialog
+
+        dialog = self.track(ThemedDialog())
+        dialog.setMinimumSize(1200, 900)
+        dialog.resize(1400, 1000)
+        with mock.patch.object(
+            layout_util, "available_geometry", return_value=QRect(0, 0, 900, 560)
+        ):
+            dialog.show()
+            self.app.processEvents()
+        self.assertLessEqual(dialog.height(), int(560 * SCREEN_MARGIN) + 1)
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestEmbeddedBinaryUI(_TrackedWidgets):
+    """空间里嵌入的二进制文件在界面上的呈现。"""
+
+    # 一个**合法**的 1×1 PNG —— 这样图片预览分支是真的在跑, 而不是被解码器拒绝
+    FAKE_PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+        "hKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    def test_binary_preview_shows_size_and_hash(self):
+        preview = self.track(BinaryPreview(theme=get_theme("dark+")))
+        file = ProjectFile(path="assets/logo.png", binary=True)
+        file.set_bytes(self.FAKE_PNG)
+        preview.set_file(file)
+        self.assertIn("已嵌入", preview.meta_label.text())
+        self.assertIn("logo.png", preview.meta_label.text())
+        self.assertTrue(preview.copy_button.isEnabled())
+        self.assertTrue(preview.export_button.isEnabled())
+
+    def test_binary_preview_flags_missing_content(self):
+        preview = self.track(BinaryPreview(theme=get_theme("dark+")))
+        preview.set_file(ProjectFile(path="old.png", binary=True, size=4096))
+        self.assertIn("未嵌入", preview.meta_label.text())
+        self.assertFalse(preview.copy_button.isEnabled())
+        self.assertFalse(preview.export_button.isEnabled())
+        self.assertIn("重新导入", preview.hex_editor.toPlainText())
+
+    def test_binary_preview_hex_dump(self):
+        preview = self.track(BinaryPreview(theme=get_theme("dark+")))
+        file = ProjectFile(path="a.bin", binary=True)
+        file.set_bytes(b"ABCDEFGH")
+        preview.set_file(file)
+        self.assertIn("41 42 43 44", preview.hex_editor.toPlainText())
+
+    def test_space_panel_switches_to_binary_tab(self):
+        db = Database.create()
+        space = db.repository.create_space("含二进制")
+        db.repository.put_space_file(
+            space.id, "assets/logo.png", binary_data=self.FAKE_PNG
+        )
+        window = self.track(MainWindow(db))
+        window.show()
+        window.entry_list.select_entry(space.id)
+        window.refresh_detail()
+        self.app.processEvents()
+
+        panel = window.space_panel
+        panel.show_file("assets/logo.png")
+        self.app.processEvents()
+        self.assertEqual(panel.tabs.currentIndex(), 2)      # 二进制内容页
+        self.assertTrue(panel.tabs.isTabEnabled(2))
+        self.assertTrue(panel.binary_preview.meta_label.text())
+        window.close()
+
+    def test_tree_marks_binary_state(self):
+        db = Database.create()
+        space = db.repository.create_space("含二进制")
+        db.repository.put_space_file(space.id, "a.png", binary_data=self.FAKE_PNG)
+        db.repository.put_space_file(space.id, "b.png", binary=True, size=10)
+        window = self.track(MainWindow(db))
+        window.show()
+        window.entry_list.select_entry(space.id)
+        window.refresh_detail()
+        self.app.processEvents()
+
+        texts = []
+        stack = [
+            window.space_panel.tree.topLevelItem(i)
+            for i in range(window.space_panel.tree.topLevelItemCount())
+        ]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            texts.append(item.text(0))
+            stack.extend(item.child(i) for i in range(item.childCount()))
+        joined = " | ".join(texts)
+        self.assertIn("已嵌入", joined)
+        self.assertIn("未嵌入", joined)
+        window.close()
+
+    def test_space_editor_imports_binary(self):
+        """走 space editor 的「导入文件…」, 内容要被嵌进工作副本。"""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "logo.png"
+            source.write_bytes(self.FAKE_PNG)
+            dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+            with mock.patch(
+                "codemethod.ui.dialogs.space_editor.QFileDialog.getOpenFileNames",
+                return_value=([str(source)], ""),
+            ):
+                dialog.import_files("assets")
+            self.app.processEvents()
+
+            files = {f.path: f for f in dialog.result_data()["files"]}
+            self.assertIn("assets/logo.png", files)
+            self.assertEqual(files["assets/logo.png"].raw_bytes(), self.FAKE_PNG)
+            self.assertIs(dialog.editor_stack.currentWidget(), dialog.binary_preview)
+
+    def test_space_editor_imports_text_and_keeps_tree(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "main.py"
+            source.write_bytes(b"print(1)\n")     # 精确控制换行, 不受平台影响
+            dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+            with mock.patch(
+                "codemethod.ui.dialogs.space_editor.QFileDialog.getOpenFileNames",
+                return_value=([str(source)], ""),
+            ):
+                dialog.import_files("src")
+            files = {f.path: f for f in dialog.result_data()["files"]}
+            self.assertEqual(files["src/main.py"].content, "print(1)\n")
+            self.assertEqual(files["src/main.py"].language, "python")
+
+    def test_space_editor_binary_tab_used(self):
+        dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+        file = ProjectFile(path="assets/logo.png", binary=True)
+        file.set_bytes(self.FAKE_PNG)
+        dialog._work_files["assets/logo.png"] = file
+        dialog._refresh_tree(select="assets/logo.png")
+        self.app.processEvents()
+        self.assertIs(dialog.editor_stack.currentWidget(), dialog.binary_preview)
+        self.assertIn("已嵌入", dialog.size_label.text())
+
+    def test_main_window_import_embeds_into_repository(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "logo.png"
+            source.write_bytes(self.FAKE_PNG)
+            db = Database.create()
+            space = db.repository.create_space("导入")
+            window = self.track(MainWindow(db))
+            window.show()
+            window.entry_list.select_entry(space.id)
+            window.refresh_detail()
+            self.app.processEvents()
+
+            with mock.patch(
+                "codemethod.ui.main_window.QFileDialog.getOpenFileNames",
+                return_value=([str(source)], ""),
+            ):
+                window.import_space_files(space.id, "")
+            self.app.processEvents()
+
+            file = db.repository.require_space(space.id).get_file("logo.png")
+            self.assertIsNotNone(file)
+            self.assertEqual(file.raw_bytes(), self.FAKE_PNG)
+            window.close()
+
+    def test_main_window_export_writes_bytes(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database.create()
+            space = db.repository.create_space("导出")
+            db.repository.put_space_file(
+                space.id, "logo.png", binary_data=self.FAKE_PNG
+            )
+            window = self.track(MainWindow(db))
+            window.show()
+            window.entry_list.select_entry(space.id)
+            window.refresh_detail()
+            self.app.processEvents()
+
+            target = Path(tmp) / "out.png"
+            with mock.patch(
+                "codemethod.ui.main_window.QFileDialog.getSaveFileName",
+                return_value=(str(target), ""),
+            ):
+                window.export_space_file(space.id, "logo.png")
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_bytes(), self.FAKE_PNG)
+            window.close()
 
 
 if __name__ == "__main__":

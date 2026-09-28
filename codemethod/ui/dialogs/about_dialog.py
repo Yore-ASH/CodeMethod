@@ -17,7 +17,7 @@ class AboutDialog(ThemedDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"关于 {APP_NAME}")
-        self.setMinimumSize(600, 460)
+        self.setMinimumSize(500, 380)
 
         root = QVBoxLayout(self)
         title = QLabel(f"{APP_NAME} {APP_VERSION}", self)

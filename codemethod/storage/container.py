@@ -242,11 +242,13 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             }
         )
 
-    # ---- 独立空间 (文件都存进容器里, 清单只记路径与大小) ----
+    # ---- 独立空间 (文件内容都存进容器里, 清单只记路径与大小) ----
     spaces = repository_data.get("spaces") or []
     space_index: List[Dict[str, Any]] = []
     space_file_total = 0
     readme_total = 0
+    embedded_binary_total = 0
+    embedded_binary_count = 0
     for space in spaces:
         if not isinstance(space, dict):
             continue
@@ -257,6 +259,9 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             for f in files
             if str(f.get("path") or "").rsplit("/", 1)[-1].lower().startswith("readme")
         )
+        embedded = [f for f in files if f.get("binary") and f.get("data")]
+        embedded_binary_count += len(embedded)
+        embedded_binary_total += sum(int(f.get("size") or 0) for f in embedded)
         langs = sorted({str(f.get("language")) for f in files})
         for lang in langs:
             language_counter[lang] = language_counter.get(lang, 0) + 1
@@ -272,6 +277,9 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
                 "languages": langs,
                 "file_count": len(files),
                 "bytes": sum(int(f.get("size") or 0) for f in files),
+                "binary_files": sum(1 for f in files if f.get("binary")),
+                "embedded_binary_files": len(embedded),
+                "embedded_binary_bytes": sum(int(f.get("size") or 0) for f in embedded),
                 "readmes": [
                     str(f.get("path")) for f in files
                     if str(f.get("path") or "").rsplit("/", 1)[-1].lower().startswith("readme")
@@ -352,6 +360,8 @@ def build_manifest(repository_data: Dict[str, Any], payload_bytes: bytes) -> Dic
             "functions": len(function_index),
             "space_files": space_file_total,
             "space_readmes": readme_total,
+            "space_embedded_binary_files": embedded_binary_count,
+            "space_embedded_binary_bytes": embedded_binary_total,
             "function_symbols": symbol_total,
             "symbols_missing_meaning": symbol_missing,
         },

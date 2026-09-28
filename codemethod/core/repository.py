@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -33,11 +34,16 @@ from .models import (
     utcnow,
 )
 from .spaces import (
+    MAX_BINARY_BYTES,
     MAX_FILES_PER_SPACE,
     MAX_FILE_BYTES,
+    MAX_SPACE_BINARY_BYTES,
     ProjectFile,
     Space,
+    decode_text,
+    human_bytes,
     is_binary_path,
+    looks_binary,
     normalize_project_path,
     search_readmes,
 )
@@ -47,6 +53,34 @@ SCHEMA_VERSION = 1
 
 class RepositoryError(Exception):
     """仓储层的可预期错误 (界面直接展示给用户)。"""
+
+
+@dataclass
+class ImportReport:
+    """一次"导入外部文件"的结果 (供界面给出准确的反馈)。"""
+
+    added: int = 0            # 新增的文件数
+    updated: int = 0          # 覆盖已有文件的数量
+    binary: int = 0           # 其中作为二进制嵌入的数量
+    text: int = 0             # 其中作为文本存进库的数量
+    total_bytes: int = 0      # 嵌入/写入的总字节数
+    skipped: List[Tuple[str, str]] = field(default_factory=list)   # (路径, 原因)
+
+    @property
+    def changed(self) -> int:
+        return self.added + self.updated
+
+    def summary(self) -> str:
+        parts = []
+        if self.added:
+            parts.append(f"新增 {self.added} 个")
+        if self.updated:
+            parts.append(f"覆盖 {self.updated} 个")
+        if self.binary:
+            parts.append(f"其中二进制 {self.binary} 个 ({human_bytes(self.total_bytes)})")
+        if self.skipped:
+            parts.append(f"跳过 {len(self.skipped)} 个")
+        return " · ".join(parts) if parts else "没有导入任何文件"
 
 
 @dataclass
@@ -906,20 +940,44 @@ class Repository:
         note: str = "",
         binary: bool = False,
         size: int = 0,
+        binary_data: Optional[bytes] = None,
         author: Optional[str] = None,
         summary: str = "",
     ) -> ProjectFile:
         """新增或覆盖空间里的一个文件。
 
-        文本内容超过 :data:`MAX_FILE_BYTES` 会被拒绝; 二进制文件只记录大小。
+        * 文本内容超过 :data:`MAX_FILE_BYTES` 会被拒绝;
+        * 传 ``binary_data`` 时把**原始字节直接嵌进库里** (base64 存进 ``data``),
+          上限 :data:`MAX_BINARY_BYTES`, 且整个空间最多嵌入
+          :data:`MAX_SPACE_BINARY_BYTES`;
+        * 只传 ``binary=True`` / ``size`` 时保持旧行为: 仅记录大小, 不保存内容。
         """
         space = self.require_space(space_id)
         normalized = normalize_project_path(path)
         if not normalized:
             raise RepositoryError("文件路径不能为空")
 
-        is_binary = binary or is_binary_path(normalized)
-        if is_binary:
+        is_binary = binary or is_binary_path(normalized) or binary_data is not None
+        if binary_data is not None:
+            payload = bytes(binary_data)
+            if len(payload) > MAX_BINARY_BYTES:
+                raise RepositoryError(
+                    f"{normalized} 有 {human_bytes(len(payload))}, 超过单个二进制文件的上限 "
+                    f"{human_bytes(MAX_BINARY_BYTES)}"
+                )
+            if not is_binary_path(normalized):
+                # 扩展名不像二进制, 但内容也不像文本 —— 仍然按二进制嵌进去
+                pass
+            left = space.binary_budget_left(exclude_path=normalized)
+            if len(payload) > left:
+                raise RepositoryError(
+                    f"空间里已嵌入的二进制接近上限: 这个文件需要 "
+                    f"{human_bytes(len(payload))}, 但只剩 {human_bytes(left)} "
+                    f"(单空间上限 {human_bytes(MAX_SPACE_BINARY_BYTES)})"
+                )
+            file = ProjectFile(path=normalized, binary=True, note=note)
+            file.set_bytes(payload)
+        elif is_binary:
             file = ProjectFile(
                 path=normalized, content="", binary=True, size=max(0, int(size)), note=note
             )
@@ -937,12 +995,182 @@ class Repository:
         old_size = existing.computed_size if existing is not None else 0
         space.put_file(file)
         action = "file_add" if existing is None else "file_update"
+        verb = "新增" if existing is None else "修改"
         detail = summary or (
-            f"{'新增' if existing is None else '修改'}文件 {normalized}"
+            f"{verb}文件 {normalized}"
             + ("" if existing is None else f" ({old_size} → {file.computed_size} 字节)")
+            + ("（二进制, 已嵌入库内）" if file.binary and file.data else "")
         )
         self._space_file_change(space, action, detail, author=author)
         return file
+
+    # ---- 导入外部文件 (内容直接嵌入 .cmdb, 不是引用) ----
+    def import_external_files(
+        self,
+        space_id: str,
+        paths: Iterable[str],
+        *,
+        base_dir: str = "",
+        target_dir: str = "",
+        author: Optional[str] = None,
+    ) -> ImportReport:
+        """把一个或多个**外部文件**读进空间。
+
+        * 二进制文件 (按扩展名或内容判断) 的原始字节会被 **base64 编码后写进容器** ——
+          拷走一个 ``.cmdb`` 就能把它们完整还原, 不依赖原路径;
+        * 文本文件按 UTF-8 读入 ``content``;
+        * ``base_dir`` 给出时, 用相对于它的路径作为库内路径, 从而保留子目录结构;
+        * ``target_dir`` 给出时, 全部文件落到这个库内目录下;
+        * 整批导入只产生**一条**修订。
+        """
+        space = self.require_space(space_id)
+        report = ImportReport()
+        created: List[ProjectFile] = []
+        before = take_snapshot(space)
+        remaining_budget = space.binary_budget_left()
+        # 已选路径先占位, 免得同一批里两个文件把预算算重
+        reserved: Dict[str, int] = {}
+
+        for raw_path in paths:
+            source = os.path.abspath(str(raw_path))
+            if not os.path.isfile(source):
+                report.skipped.append((str(raw_path), "不是文件或不存在"))
+                continue
+
+            relative = self._relative_import_path(source, base_dir)
+            if target_dir:
+                relative = f"{normalize_project_path(target_dir)}/{relative}"
+            normalized = normalize_project_path(relative)
+            if not normalized:
+                report.skipped.append((str(raw_path), "路径无效"))
+                continue
+
+            existing = space.get_file(normalized)
+            if existing is None and len(space.files) + len(created) >= MAX_FILES_PER_SPACE:
+                report.skipped.append((normalized, f"超过单空间 {MAX_FILES_PER_SPACE} 个文件的上限"))
+                continue
+
+            try:
+                with open(source, "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                report.skipped.append((normalized, f"读取失败: {exc.strerror or exc}"))
+                continue
+
+            by_extension = is_binary_path(normalized)
+            binary = by_extension or looks_binary(raw)
+
+            if binary:
+                if len(raw) > MAX_BINARY_BYTES:
+                    report.skipped.append(
+                        (normalized, f"{human_bytes(len(raw))} 超过单文件上限 {human_bytes(MAX_BINARY_BYTES)}")
+                    )
+                    continue
+                budget = remaining_budget - reserved.get(normalized, 0)
+                if len(raw) > budget:
+                    report.skipped.append(
+                        (normalized, f"空间二进制余量不足 (还需 {human_bytes(len(raw))}, 只剩 {human_bytes(budget)})")
+                    )
+                    continue
+                reserved[normalized] = reserved.get(normalized, 0) + len(raw)
+                file = ProjectFile(path=normalized, binary=True)
+                file.set_bytes(raw)
+            else:
+                body = decode_text(raw)
+                if body is None:      # pragma: no cover - looks_binary 已拦下
+                    report.skipped.append((normalized, "既不是合法 UTF-8 也不是二进制"))
+                    continue
+                if len(raw) > MAX_FILE_BYTES:
+                    report.skipped.append(
+                        (normalized, f"{human_bytes(len(raw))} 超过单文件上限 {human_bytes(MAX_FILE_BYTES)}")
+                    )
+                    continue
+                file = ProjectFile(path=normalized, content=body)
+
+            if existing is not None:
+                file.note = existing.note
+                report.updated += 1
+            else:
+                report.added += 1
+            report.total_bytes += file.computed_size
+            if binary:
+                report.binary += 1
+            else:
+                report.text += 1
+            created.append(file)
+
+        for file in created:
+            space.put_file(file)
+        if created:
+            detail = f"导入 {len(created)} 个外部文件 ({report.summary()})"
+            if report.updated:
+                # 覆盖已有文件时把"哪个文件的内容变了"也带上 —— 尤其是二进制,
+                # 用户不可能从 base64 里看出差别, 只能靠这句话。
+                changes = summarize_changes(before, take_snapshot(space))
+                if changes and changes != "无实质变更":
+                    detail += f"; {changes}"
+            self._space_file_change(space, "file_add", detail, author=author)
+        return report
+
+    @staticmethod
+    def _relative_import_path(source: str, base_dir: str) -> str:
+        """决定外部文件在空间里的相对路径。"""
+        name = os.path.basename(source)
+        if not base_dir:
+            return name
+        try:
+            relative = os.path.relpath(source, os.path.abspath(base_dir))
+        except ValueError:      # pragma: no cover - 跨盘符
+            return name
+        if relative.startswith(".."):
+            return name
+        return relative.replace(os.sep, "/")
+
+    def import_external_directory(
+        self,
+        space_id: str,
+        directory: str,
+        *,
+        recursive: bool = True,
+        target_dir: str = "",
+        author: Optional[str] = None,
+    ) -> ImportReport:
+        """导入一个外部目录 (保留子目录结构)。"""
+        root = os.path.abspath(directory)
+        if not os.path.isdir(root):
+            raise RepositoryError(f"目录不存在: {directory}")
+        collected: List[str] = []
+        if recursive:
+            for current, dirs, files in os.walk(root):
+                dirs[:] = sorted(d for d in dirs if d not in (".git", "__pycache__", ".venv"))
+                for name in sorted(files):
+                    collected.append(os.path.join(current, name))
+        else:
+            collected = [
+                os.path.join(root, name)
+                for name in sorted(os.listdir(root))
+                if os.path.isfile(os.path.join(root, name))
+            ]
+        return self.import_external_files(
+            space_id, collected, base_dir=root, target_dir=target_dir, author=author
+        )
+
+    def export_space_file(
+        self, space_id: str, path: str, target: str
+    ) -> int:
+        """把空间里的一个文件写到磁盘, 返回字节数。"""
+        space = self.require_space(space_id)
+        file = space.get_file(path)
+        if file is None:
+            raise RepositoryError(f"文件不存在: {path}")
+        if file.binary and not file.data:
+            raise RepositoryError(
+                f"{path} 只有大小记录、没有内容 (旧版本保存的二进制文件), 无法导出"
+            )
+        try:
+            return file.write_to(target)
+        except OSError as exc:
+            raise RepositoryError(f"写入失败: {exc.strerror or exc}") from exc
 
     def rename_space_file(
         self,
@@ -999,20 +1227,35 @@ class Repository:
     def import_space_files(
         self,
         space_id: str,
-        files: Iterable[Tuple[str, str]],
+        files: Iterable[Tuple[str, Any]],
         *,
         author: Optional[str] = None,
         summary: str = "",
     ) -> int:
-        """批量导入 ``(相对路径, 文本内容)``, 只产生**一条**修订。"""
+        """批量导入 ``(相对路径, 内容)``, 只产生**一条**修订。
+
+        内容可以是 ``str`` (文本) 或 ``bytes`` (二进制, 会被嵌入库内)。
+        """
         space = self.require_space(space_id)
         count = 0
         for path, content in files:
             normalized = normalize_project_path(path)
-            if not normalized or is_binary_path(normalized):
+            if not normalized:
                 continue
             try:
-                space.put_file(ProjectFile(path=normalized, content=str(content)))
+                if isinstance(content, (bytes, bytearray)):
+                    payload = bytes(content)
+                    if len(payload) > MAX_BINARY_BYTES:
+                        continue
+                    if len(payload) > space.binary_budget_left(exclude_path=normalized):
+                        continue
+                    file = ProjectFile(path=normalized, binary=True)
+                    file.set_bytes(payload)
+                else:
+                    if is_binary_path(normalized):
+                        continue
+                    file = ProjectFile(path=normalized, content=str(content))
+                space.put_file(file)
                 count += 1
             except Exception:  # pragma: no cover - 单条失败不影响其余
                 continue
@@ -1796,6 +2039,7 @@ class Repository:
 __all__ = [
     "Repository",
     "RepositoryError",
+    "ImportReport",
     "TagInfo",
     "TAG_PALETTE",
     "SCHEMA_VERSION",

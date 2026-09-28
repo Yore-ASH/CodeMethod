@@ -47,7 +47,7 @@ class ImplementationDialog(ThemedDialog):
             self.setWindowTitle(
                 f"编辑实现 · {get_language(implementation.language).name}"
             )
-        self.setMinimumSize(820, 600)
+        self.setMinimumSize(660, 460)
         self.resize(980, 700)
 
         root = QVBoxLayout(self)

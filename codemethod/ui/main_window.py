@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QSettings, Qt, QTimer
@@ -47,7 +48,7 @@ from ..core.languages import get_language, language_choices, normalize_language
 from ..core.models import STATUS_LABELS, STATUS_ORDER, Entry, format_ts
 from ..core.query import QuerySpec, TagMatch, query_entries, related_tags
 from ..core.repository import Repository, RepositoryError
-from ..core.spaces import normalize_project_path
+from ..core.spaces import human_bytes, normalize_project_path
 from ..storage import exporter
 from ..storage.container import BINARY_EXTENSIONS, TEXT_EXTENSIONS, human_size
 from ..storage.database import Database, DatabaseError
@@ -220,10 +221,14 @@ class MainWindow(QMainWindow):
         self._suppress_selection_signal = False
         # 窗口正在关闭/析构: 此后所有刷新槽函数直接返回
         self._tearing_down = False
+        # 首次显示时是否已经按屏幕可用区域夹过尺寸
+        self._geometry_fitted = False
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
-        self.setMinimumSize(1080, 700)
+        # 最小尺寸要留给小屏: 三栏各自的硬性最小宽度合计约 840, 所以 880 是底线。
+        # 首选仍是 1440×900, 显示时再按屏幕可用区域夹一次 (见 showEvent)。
+        self.setMinimumSize(880, 560)
         self.resize(1440, 900)
 
         self._build_actions()
@@ -663,6 +668,8 @@ class MainWindow(QMainWindow):
         self.function_panel.purge_requested.connect(lambda _id: self.purge_entry())
         self.space_panel.restore_requested.connect(lambda _id: self.restore_entry())
         self.space_panel.purge_requested.connect(lambda _id: self.purge_entry())
+        self.space_panel.import_files_requested.connect(self.import_space_files)
+        self.space_panel.export_file_requested.connect(self.export_space_file)
         self.detail_panel.restore_requested.connect(lambda _id: self.restore_entry())
         self.detail_panel.purge_requested.connect(lambda _id: self.purge_entry())
 
@@ -1442,12 +1449,14 @@ class MainWindow(QMainWindow):
             self.set_status(f"文件不存在: {path}")
             return
         if file.binary:
-            self.show_error("无法编辑", f"{path} 被标记为二进制文件, 只记录了大小。")
+            self.reimport_space_file(space.id, path)
             return
 
         dialog = ThemedDialog(self)
         dialog.setWindowTitle(f"编辑 {path}")
-        dialog.setMinimumSize(820, 620)
+        # 最小尺寸留小 + 显示时按屏幕夹一次, 保证底部的「保存」永远在屏幕里
+        dialog.setMinimumSize(460, 300)
+        dialog.resize(900, 660)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1465,10 +1474,20 @@ class MainWindow(QMainWindow):
         note_row.addWidget(note_edit, 1)
         layout.addLayout(note_row)
         buttons = QDialogButtonBox(dialog)
-        buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
-        buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole).clicked.connect(dialog.reject)
+        save_button = buttons.addButton("保存 (Ctrl+S)", QDialogButtonBox.ButtonRole.AcceptRole)
+        save_button.setToolTip("快捷键 Ctrl+S")
+        buttons.addButton("取消 (Esc)", QDialogButtonBox.ButtonRole.RejectRole).clicked.connect(
+            dialog.reject
+        )
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
+
+        # Ctrl+S 直接保存 —— 不用去够那个按钮
+        save_action = QAction(dialog)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.triggered.connect(dialog.accept)
+        dialog.addAction(save_action)
+        editor.setFocus()
 
         if dialog.exec() != ThemedDialog.DialogCode.Accepted:
             return
@@ -1482,6 +1501,139 @@ class MainWindow(QMainWindow):
         self.refresh_all(select_id=space.id)
         self.space_panel.show_file(path)
         self.set_status(f"已保存 {path}")
+
+    # ==================================================================================
+    # 导入 / 导出外部文件 (内容直接嵌入 .cmdb, 不是引用)
+    # ==================================================================================
+    def import_space_files(self, space_id: str, target: str = "") -> None:
+        """导入磁盘上的一个或多个文件。``target`` 可以是目录, 或 ``\\x00<路径>`` 表示替换某个文件。"""
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        replace_path = ""
+        directory = target
+        if target.startswith("\x00"):
+            replace_path = target[1:]
+            directory = ""
+        elif target == "\x01":
+            # "导入整个目录"
+            self.import_space_directory(space.id)
+            return
+
+        if replace_path:
+            source, _filter = QFileDialog.getOpenFileName(
+                self, f"选择要嵌入 {replace_path} 的文件", "", "所有文件 (*.*)"
+            )
+            if not source:
+                return
+            try:
+                raw = Path(source).read_bytes()
+            except OSError as exc:
+                self.show_error("读取失败", str(exc.strerror or exc))
+                return
+            try:
+                file = self.db.repository.put_space_file(
+                    space.id, replace_path, binary_data=raw
+                )
+            except RepositoryError as exc:
+                self.show_error("导入失败", str(exc))
+                return
+            self.refresh_all(select_id=space.id)
+            self.space_panel.show_file(file.path)
+            self.set_status(
+                f"已把 {Path(source).name} ({human_bytes(file.size)}) 嵌入 {file.path}"
+            )
+            return
+
+        chosen, _filter = QFileDialog.getOpenFileNames(
+            self,
+            "导入外部文件 (内容会被嵌入代码库, 不是引用)",
+            "",
+            "所有文件 (*.*)",
+        )
+        if not chosen:
+            return
+        self._embed_external(space.id, chosen, base_dir="", target_dir=directory)
+
+    def import_space_directory(self, space_id: str) -> None:
+        """导入整个外部目录 (保留子目录结构)。"""
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择要导入的目录 (会保留子目录结构)", ""
+        )
+        if not directory:
+            return
+        answer = QMessageBox.question(
+            self,
+            "导入整个目录",
+            f"把 {directory} 里的全部文件复制进《{space.display_title}》吗?\n\n"
+            "文件内容会被**完整嵌入** .cmdb (二进制也一样), 之后不再依赖原目录。\n"
+            "跳过 .git / __pycache__ / .venv。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            report = self.db.repository.import_external_directory(space.id, directory)
+        except RepositoryError as exc:
+            self.show_error("导入目录失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        message = f"已从 {Path(directory).name}/ 导入: {report.summary()}"
+        self.set_status(message)
+        if report.skipped:
+            QMessageBox.warning(
+                self,
+                "部分文件未导入",
+                f"成功 {report.changed} 个, 跳过 {len(report.skipped)} 个:\n\n"
+                + "\n".join(f"{p} — {why}" for p, why in report.skipped[:12]),
+            )
+
+    def _embed_external(
+        self, space_id: str, sources: List[str], *, base_dir: str, target_dir: str = ""
+    ) -> None:
+        """把外部文件嵌进空间; ``base_dir`` 非空时保留相对目录结构。"""
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        try:
+            report = self.db.repository.import_external_files(
+                space_id, sources, base_dir=base_dir, target_dir=target_dir
+            )
+        except RepositoryError as exc:
+            self.show_error("导入失败", str(exc))
+            return
+        self.refresh_all(select_id=space.id)
+        self.set_status(f"已导入 {space.display_title}: {report.summary()}")
+        if report.skipped:
+            QMessageBox.warning(
+                self,
+                "部分文件未导入",
+                f"成功 {report.changed} 个, 跳过 {len(report.skipped)} 个:\n\n"
+                + "\n".join(f"{p} — {why}" for p, why in report.skipped[:12]),
+            )
+
+    def export_space_file(self, space_id: str, path: str) -> None:
+        """把空间里的一个文件 (含嵌入的二进制) 还原到磁盘。"""
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        file = space.get_file(path)
+        if file is None:
+            self.set_status(f"文件不存在: {path}")
+            return
+        target, _filter = QFileDialog.getSaveFileName(
+            self, f"导出 {path}", Path(path).name, "所有文件 (*.*)"
+        )
+        if not target:
+            return
+        try:
+            written = self.db.repository.export_space_file(space.id, path, target)
+        except RepositoryError as exc:
+            self.show_error("导出失败", str(exc))
+            return
+        self.set_status(f"已导出 {path} → {target} ({human_bytes(written)})")
 
     def add_space_directory(self, space_id: str) -> None:
         space = self._require_space(space_id)
@@ -2244,6 +2396,15 @@ class MainWindow(QMainWindow):
         from .native import apply_titlebar_theme
 
         apply_titlebar_theme(self, self.theme)
+
+        # 首次显示时把窗口夹进屏幕可用区域。首选尺寸 1440×900 在 1536×864 的屏幕上
+        # 比可用高度还高 (还不算任务栏), 于是窗口底部的历史面板沉到屏幕外; 而对话框
+        # 默认以父窗口为中心弹出 —— 父窗口下沉会把「保存」一起推到屏幕下方点不到。
+        if not self._geometry_fitted:
+            self._geometry_fitted = True
+            from .layout_util import fit_window_to_screen
+
+            fit_window_to_screen(self)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if not self._confirm_discard():

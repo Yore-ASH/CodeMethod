@@ -150,6 +150,14 @@ def _common_fields_diff(
         chunks.append("")
 
 
+def _binary_label(item: Dict[str, Any]) -> str:
+    """二进制文件在差异视图里的一句话描述 (绝不输出 base64 正文)。"""
+    size = int(item.get("size") or 0)
+    if item.get("data"):
+        return f"（二进制, {size} 字节, 内容已嵌入）"
+    return f"（二进制, {size} 字节, 仅记录大小）"
+
+
 def _space_diff(
     before: Dict[str, Any], after: Dict[str, Any], context: int
 ) -> List[str]:
@@ -202,6 +210,20 @@ def _space_diff(
             chunks.append(f"+{new_language}")
             chunks.append("")
         if old_item.get("binary"):
+            # 二进制内容绝不 dump 出来 (base64 会把差异视图淹掉), 只报"变了多少"
+            old_data = str(old_item.get("data") or "")
+            new_data = str(new_item.get("data") or "")
+            if old_data != new_data:
+                chunks.append(f"### {path} · 二进制内容")
+                chunks.append(
+                    "-"
+                    + _binary_label(old_item)
+                )
+                chunks.append(
+                    "+"
+                    + _binary_label(new_item)
+                )
+                chunks.append("")
             continue
         content_diff = _unified_diff(
             str(old_item.get("content") or ""), str(new_item.get("content") or ""), path, context
@@ -483,6 +505,12 @@ def _summarize_space(before: Dict[str, Any], after: Dict[str, Any]) -> str:
     for path in sorted(set(old_files) & set(new_files)):
         old_item, new_item = old_files[path], new_files[path]
         if bool(old_item.get("binary")) or bool(new_item.get("binary")):
+            # 二进制文件只报"内容/大小变了", 不参与行级统计
+            if str(old_item.get("data") or "") != str(new_item.get("data") or ""):
+                bits.append(
+                    f"{path} 二进制内容变更 "
+                    f"({int(old_item.get('size') or 0)} → {int(new_item.get('size') or 0)} 字节)"
+                )
             continue
         if str(old_item.get("content") or "") != str(new_item.get("content") or ""):
             plus, minus = _count_line_changes(

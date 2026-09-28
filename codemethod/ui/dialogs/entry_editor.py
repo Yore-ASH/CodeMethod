@@ -272,7 +272,7 @@ class EntryEditorDialog(ThemedDialog):
         self._editors: List[ImplementationEditor] = []
 
         self.setWindowTitle("编辑条目" if entry else "新建条目")
-        self.setMinimumSize(980, 680)
+        self.setMinimumSize(760, 520)
         self.resize(1120, 760)
 
         root = QVBoxLayout(self)

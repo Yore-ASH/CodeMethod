@@ -23,7 +23,7 @@ import ctypes
 import sys
 from typing import Optional
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
@@ -141,12 +141,26 @@ class ThemedDialog(QDialog):
     """带原生标题栏着色的对话框基类。
 
     所有对话框都继承它, 这样在 Windows 上不会出现"深色界面 + 白色标题栏"的割裂感。
+
+    另外在 ``showEvent`` 里统一做一次**屏幕适配**: 对话框声明的尺寸若超过屏幕
+    可用区域 (小笔记本 / 高 DPI 缩放很容易触发), 就把它和它的最小尺寸一起压到
+    放得下的范围并居中 —— 否则底部的「保存 / 取消」会跑到屏幕外, 用户必须先手动
+    把窗口改小才能点保存。
     """
+
+    def __init__(self, parent=None, flags=Qt.WindowType.Window) -> None:  # noqa: ANN001
+        super().__init__(parent, flags)
+        self._screen_fitted = False
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         super().showEvent(event)
         themer = current_themer()
         apply_titlebar_theme(self, themer.theme if themer is not None else DEFAULT_THEME)
+        if not self._screen_fitted:
+            self._screen_fitted = True
+            from .layout_util import fit_dialog_to_screen
+
+            fit_dialog_to_screen(self)
 
 
 # 应用级单例 (由 ui.theme.apply_theme 创建/复用)

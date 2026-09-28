@@ -93,7 +93,7 @@ class VerifyResultDialog(ThemedDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("完整性校验")
-        self.setMinimumSize(560, 360)
+        self.setMinimumSize(480, 320)
 
         root = QVBoxLayout(self)
         headline = QLabel(

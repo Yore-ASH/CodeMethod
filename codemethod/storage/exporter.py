@@ -23,7 +23,7 @@ from ..core.functions import Function
 from ..core.languages import get_language
 from ..core.models import STATUS_LABELS, Entry, Revision, format_ts
 from ..core.repository import Repository
-from ..core.spaces import Space
+from ..core.spaces import Space, human_bytes
 
 # 语言 id -> Markdown 围栏标注 / 文件扩展名
 _FENCE = {
@@ -207,10 +207,23 @@ def space_to_markdown(space: Space, *, revisions: Optional[List[Revision]] = Non
     if space.files:
         lines.append("```")
         for file in sorted(space.files, key=lambda f: f.path):
-            size = f"{file.size} B"
-            lines.append(f"{file.path:<52} {get_language(file.language).name:<12} {size}")
+            marks = ""
+            if file.binary:
+                marks = "  [已嵌入]" if file.data else "  [仅记录大小]"
+            lines.append(
+                f"{file.path:<52} {get_language(file.language).name:<12} "
+                f"{file.size_label}{marks}"
+            )
         lines.append("```")
         lines.append("")
+        embedded = space.embedded_binary_files
+        if embedded:
+            lines.append(
+                f"> 这个空间里嵌入了 **{len(embedded)} 个二进制文件** "
+                f"(共 {human_bytes(space.embedded_binary_bytes)})。"
+                "内容以 base64 存在 ``.cmdb`` 内, 导出 ZIP 时会还原成原始字节。"
+            )
+            lines.append("")
 
     for readme in space.readme_files:
         lines.append(f"### {readme.path}")
@@ -522,13 +535,19 @@ def export_zip(repo: Repository, path: str, entries: Optional[Iterable[Entry]] =
             for file in space.files:
                 if not file.path:
                     continue
-                # 二进制文件在库里只存了大小, 导出时放一个说明占位
-                body = (
-                    f"（二进制文件, {file.size} 字节; CodeMethod 只记录了大小, 未保存内容）\n"
-                    if file.binary
-                    else file.content
-                )
-                archive.writestr(f"{folder}/{file.path}", body)
+                if file.binary:
+                    raw = file.raw_bytes()
+                    if raw:
+                        # 内容真的嵌在库里 → 还原成**原始字节**, 字节级一致
+                        archive.writestr(f"{folder}/{file.path}", raw)
+                    else:
+                        archive.writestr(
+                            f"{folder}/{file.path}.README.txt",
+                            f"（二进制文件 {file.path}, {file.size} 字节; "
+                            "这个库是旧版本保存的, 只记录了大小, 未嵌入内容）\n",
+                        )
+                    continue
+                archive.writestr(f"{folder}/{file.path}", file.content)
 
         # ---- 函数体: 每种语言一个源码文件 + 含义表 ----
         for function in functions:

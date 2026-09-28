@@ -30,11 +30,12 @@ from PySide6.QtWidgets import (
 
 from ...core.languages import get_language
 from ...core.models import STATUS_COLORS, STATUS_LABELS, format_ts
-from ...core.spaces import ProjectFile, Space, TreeNode
+from ...core.spaces import ProjectFile, Space, TreeNode, human_bytes
 from ..editor import CodePreview
 from ..theme import DEFAULT_THEME, Theme
 from .language_bar import LanguageBar, LanguageLegend
 from .action_button import fit_action_button
+from .binary_preview import BinaryPreview
 from .deleted_notice import DeletedNotice
 from .tag_chip import TagChipBar
 
@@ -73,7 +74,15 @@ class SpaceTree(QTreeWidget):
                 item.setExpanded(True)
             else:
                 language = get_language(child.language)
-                item.setText(0, f"{child.name}   {language.name} · {child.size} B")
+                if child.binary:
+                    mark = "已嵌入" if child.embedded else "未嵌入"
+                    item.setText(
+                        0, f"{child.name}   二进制 · {human_bytes(child.size)} · {mark}"
+                    )
+                else:
+                    item.setText(
+                        0, f"{child.name}   {language.name} · {human_bytes(child.size)}"
+                    )
                 item.setData(0, Qt.ItemDataRole.UserRole, ("file", child.path))
 
     def _entry_at(self, item: Optional[QTreeWidgetItem]):
@@ -117,6 +126,8 @@ class SpaceDetailPanel(QWidget):
     rename_file_requested = Signal(str, str)
     restore_requested = Signal(str)
     purge_requested = Signal(str)
+    import_files_requested = Signal(str, str)      # (space_id, 目标目录)
+    export_file_requested = Signal(str, str)       # (space_id, path)
 
     def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
@@ -227,10 +238,16 @@ class SpaceDetailPanel(QWidget):
         )
         self._add_file_button = QPushButton("＋ 文件", header)
         self._add_file_button.setProperty("flat", True)
-        self._add_file_button.setToolTip("在空间里新建一个文件")
+        self._add_file_button.setToolTip("在空间里新建一个空文件")
         self._add_file_button.clicked.connect(
             lambda: self._space and self.add_file_requested.emit(self._space.id)
         )
+        self._import_button = QPushButton("导入外部文件", header)
+        self._import_button.setProperty("flat", True)
+        self._import_button.setToolTip(
+            "把磁盘上的文件**复制进代码库** (二进制也会被完整嵌入, 不是引用)"
+        )
+        self._import_button.clicked.connect(self._request_import)
         self._more_button = QToolButton(header)
         self._more_button.setText("⋯")
         self._more_button.setFixedWidth(30)
@@ -238,7 +255,12 @@ class SpaceDetailPanel(QWidget):
         self._more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._build_more_menu()
 
-        for button in (self._edit_button, self._history_button, self._add_file_button):
+        for button in (
+            self._edit_button,
+            self._history_button,
+            self._add_file_button,
+            self._import_button,
+        ):
             fit_action_button(button)
             actions.addWidget(button)
         actions.addWidget(self._more_button)
@@ -254,6 +276,8 @@ class SpaceDetailPanel(QWidget):
         menu = QMenu(self._more_button)
         items = [
             ("新建文件…", lambda: self._space and self.add_file_requested.emit(self._space.id)),
+            ("导入外部文件…", self._request_import),
+            ("导入整个目录…", lambda: self._space and self.import_files_requested.emit(self._space.id, "\x01")),
             ("新建目录…", lambda: self._space and self.add_directory_requested.emit(self._space.id)),
             (None, None),
             ("复制全部文件到剪贴板", self._copy_all_files),
@@ -271,6 +295,10 @@ class SpaceDetailPanel(QWidget):
             action.triggered.connect(slot)
             menu.addAction(action)
         self._more_button.setMenu(menu)
+
+    def _request_import(self) -> None:
+        if self._space is not None:
+            self.import_files_requested.emit(self._space.id, "")
 
     def _build_tree_panel(self) -> QWidget:
         panel = QWidget(self._content)
@@ -367,15 +395,44 @@ class SpaceDetailPanel(QWidget):
         self._preview_path = ""
         self.tabs.addTab(self._editor_tab, "文件内容")
         self.tabs.setTabEnabled(1, False)
+
+        # 二进制文件用专门的预览页 (图片直接画出来, 其它给十六进制)
+        self.binary_preview = BinaryPreview(self.tabs, theme=self._theme)
+        self.binary_preview.copy_done.connect(self.copy_done)
+        self.binary_preview.export_requested.connect(self._export_current_binary)
+        self.binary_preview.import_requested.connect(self._reimport_current_binary)
+        self.tabs.addTab(self.binary_preview, "二进制内容")
+        self.tabs.setTabEnabled(2, False)
         return self.tabs
+
+    def _export_current_binary(self) -> None:
+        if self._space is not None and self._preview_path:
+            self.export_file_requested.emit(self._space.id, self._preview_path)
+
+    def _reimport_current_binary(self) -> None:
+        if self._space is not None and self._preview_path:
+            self.import_files_requested.emit(self._space.id, "\x00" + self._preview_path)
 
     # ----------------------------------------------------------------------------
     def _on_file_menu(self, path: str, global_pos) -> None:
         if self._space is None:
             return
+        file = self._space.get_file(path)
         menu = QMenu(self)
-        menu.addAction("打开", lambda: self.open_file_requested.emit(self._space.id, path))
-        menu.addAction("编辑…", lambda: self.edit_file_requested.emit(self._space.id, path))
+        if file is not None and not file.binary:
+            menu.addAction("打开", lambda: self.open_file_requested.emit(self._space.id, path))
+            menu.addAction("编辑…", lambda: self.edit_file_requested.emit(self._space.id, path))
+        elif file is not None:
+            menu.addAction("查看二进制…", lambda: self.open_file_requested.emit(self._space.id, path))
+            menu.addAction(
+                "重新导入内容…",
+                lambda: self.import_files_requested.emit(self._space.id, "\x00" + path),
+            )
+            if file.data:
+                menu.addAction(
+                    "导出到磁盘…",
+                    lambda: self.export_file_requested.emit(self._space.id, path),
+                )
         menu.addSeparator()
         menu.addAction("重命名…", lambda: self.rename_file_requested.emit(self._space.id, path))
         menu.addAction("复制内容", lambda: self._copy_file(path))
@@ -388,6 +445,10 @@ class SpaceDetailPanel(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("在此新建文件…", lambda: self._request_file_in(path))
+        menu.addAction(
+            "导入文件到此处…",
+            lambda: self.import_files_requested.emit(self._space.id, path),
+        )
         menu.addAction("新建目录…", lambda: self.add_directory_requested.emit(self._space.id))
         if path:
             menu.addSeparator()
@@ -419,7 +480,13 @@ class SpaceDetailPanel(QWidget):
         parts: List[str] = []
         for file in sorted(self._space.files, key=lambda f: f.path):
             parts.append(f"===== {file.path} =====")
-            parts.append(file.content if not file.binary else f"（二进制, {file.size} 字节）")
+            if file.binary:
+                parts.append(
+                    f"（二进制, {human_bytes(file.size)}"
+                    + (", 内容已嵌入库内)" if file.data else ", 仅记录大小)")
+                )
+            else:
+                parts.append(file.content)
             parts.append("")
         text = "\n".join(parts)
         QApplication.clipboard().setText(text)
@@ -454,10 +521,19 @@ class SpaceDetailPanel(QWidget):
             f"border:1px solid {STATUS_COLORS.get(space.status, self._theme.text_muted)};"
             "border-radius:8px; padding:1px 8px;"
         )
-        self._meta.setText(
-            f"更新 {format_ts(space.updated_at)} · {len(space.files)} 个文件 · "
-            f"{space.total_lines} 行 · {space.total_size} 字节 · ID {space.id}"
-        )
+        embedded = space.embedded_binary_files
+        meta_parts = [
+            f"更新 {format_ts(space.updated_at)}",
+            f"{len(space.files)} 个文件",
+            f"{space.total_lines} 行",
+            human_bytes(space.total_size),
+        ]
+        if embedded:
+            meta_parts.append(
+                f"嵌入二进制 {len(embedded)} 个 / {human_bytes(space.embedded_binary_bytes)}"
+            )
+        meta_parts.append(f"ID {space.id}")
+        self._meta.setText(" · ".join(meta_parts))
 
         self.tree.load(space.tree())
         self._tree_count.setText(f"({len(space.files)} 个文件)")
@@ -531,27 +607,38 @@ class SpaceDetailPanel(QWidget):
     def _show_file(self, path: str) -> None:
         if self._space is None or not path:
             self.tabs.setTabEnabled(1, False)
+            self.tabs.setTabEnabled(2, False)
             self._preview_path = ""
             return
         file = self._space.get_file(path)
         if file is None:
             self.tabs.setTabEnabled(1, False)
+            self.tabs.setTabEnabled(2, False)
             return
         self._preview_path = path
         if file.binary:
+            # 二进制走专门的预览页; 文本页仍然给一句说明, 免得看到空白
             self.preview.set_code(
-                f"（二进制文件, {file.size} 字节 —— CodeMethod 只记录大小, 不保存内容）",
+                f"（二进制文件 {file.name} · {human_bytes(file.size)} · "
+                + ("内容已嵌入代码库, 切到「二进制内容」页查看)" if file.data
+                   else "旧格式: 只记录了大小, 没有内容)"),
                 language="plaintext",
                 filename=file.name,
             )
+            self.binary_preview.set_file(file)
+            self.tabs.setTabEnabled(2, True)
+            self.tabs.setTabText(2, f"二进制内容 · {file.name}")
         else:
             self.preview.set_code(file.content, language=file.language, filename=file.path)
+            self.binary_preview.set_file(None)
+            self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(1, True)
         self.tabs.setTabText(1, file.name)
 
     def show_file(self, path: str) -> None:
         self._show_file(path)
-        self.tabs.setCurrentIndex(1)
+        file = self._space.get_file(path) if self._space is not None else None
+        self.tabs.setCurrentIndex(2 if (file is not None and file.binary) else 1)
 
     def set_deleted_notice(self, is_deleted: bool) -> None:
         """对象在回收站里时, 顶部显示恢复提示条。"""
@@ -569,7 +656,7 @@ class SpaceDetailPanel(QWidget):
             self.copy_done.emit("文件不存在")
             return
         if file.binary:
-            self.copy_done.emit(f"{file.path} 是二进制文件, 只记录了大小, 无法复制内容")
+            self.binary_preview._copy_hex()
             return
         QApplication.clipboard().setText(file.content)
         self.copy_done.emit(
@@ -583,9 +670,15 @@ class SpaceDetailPanel(QWidget):
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         self.preview.editor.set_theme(theme)
+        self.binary_preview.set_theme(theme)
         self.language_bar.set_theme(theme)
         self.language_legend.set_theme(theme)
-        for button in (self._edit_button, self._history_button, self._add_file_button):
+        for button in (
+            self._edit_button,
+            self._history_button,
+            self._add_file_button,
+            self._import_button,
+        ):
             fit_action_button(button)
 
 

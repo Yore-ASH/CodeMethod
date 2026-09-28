@@ -49,7 +49,7 @@ class TagManagerDialog(ThemedDialog):
         self._repo = repository
         self._theme = theme
         self.setWindowTitle("标签管理")
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(520, 380)
 
         root = QVBoxLayout(self)
         root.setSpacing(8)

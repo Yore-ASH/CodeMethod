@@ -422,7 +422,7 @@ class FunctionEditorDialog(ThemedDialog):
         self._current_index = -1
 
         self.setWindowTitle("新建函数体" if self._is_new else "编辑函数体")
-        self.setMinimumSize(1040, 720)
+        self.setMinimumSize(780, 520)
         self.resize(1240, 840)
 
         root = QVBoxLayout(self)
