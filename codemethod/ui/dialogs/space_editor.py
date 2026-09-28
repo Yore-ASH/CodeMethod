@@ -11,7 +11,7 @@ import posixpath
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -59,6 +60,8 @@ from ..native import ThemedDialog
 from ..theme import DEFAULT_THEME, Theme
 from ..widgets.binary_preview import BinaryPreview
 from ..widgets.language_bar import LanguageBar, LanguageLegend
+from .directory_import import DirectoryImportDialog
+from .new_directory import PLACEHOLDER_NAME, NewDirectoryDialog
 
 
 class SpaceEditorDialog(ThemedDialog):
@@ -195,6 +198,7 @@ class SpaceEditorDialog(ThemedDialog):
         for text, tip, slot in (
             ("＋ 文件", "新建一个空文件", self.add_file),
             ("导入文件…", "把磁盘上的文件复制进库里 (二进制也会完整嵌入, 不是引用)", self.import_files),
+            ("导入目录…", "把一整个目录连同子文件夹打包进来 (先预览再导入)", self.import_directory),
             ("＋ 目录", "新建一个目录", self.add_directory),
             ("重命名", "重命名选中的文件", self.rename_selected),
             ("删除", "删除选中的文件或目录", self.delete_selected),
@@ -211,6 +215,12 @@ class SpaceEditorDialog(ThemedDialog):
 
         self.tree = QTreeWidget(h_splitter)
         self.tree.setHeaderHidden(True)
+        # 第 0 列文件名, 第 1 列用淡化颜色显示类型/大小 (不然和文件名挤在一起很乱)
+        self.tree.setColumnCount(2)
+        tree_header = self.tree.header()
+        tree_header.setStretchLastSection(False)
+        tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_menu)
         self.tree.currentItemChanged.connect(lambda *_: self._on_tree_selection())
@@ -296,17 +306,30 @@ class SpaceEditorDialog(ThemedDialog):
                 marker = " ●" if child.path in self._dirty_paths else ""
                 if child.binary:
                     state = "已嵌入" if child.embedded else "未嵌入"
-                    item.setText(
-                        0,
-                        f"{child.name}   二进制 · {human_bytes(child.size)} · {state}{marker}",
-                    )
+                    meta = f"二进制 · {human_bytes(child.size)} · {state}{marker}"
                 else:
                     language = get_language(file.language if file else "plaintext").name
-                    item.setText(
-                        0,
-                        f"{child.name}   {language} · {human_bytes(child.size)}{marker}",
-                    )
+                    meta = f"{language} · {human_bytes(child.size)}{marker}"
+                item.setText(0, child.name)
+                item.setText(1, meta)
                 item.setData(0, Qt.ItemDataRole.UserRole, ("file", child.path))
+                self._decorate_meta(item)
+
+    def _decorate_meta(self, item: QTreeWidgetItem) -> None:
+        """把第 1 列 (类型/大小) 统一淡化成次要色并右对齐。"""
+        if not item.text(1):
+            return
+        item.setForeground(1, QColor(self._theme.text_dim))
+        item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def _decorate_all_meta(self) -> None:
+        stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            self._decorate_meta(item)
+            stack.extend(item.child(i) for i in range(item.childCount()))
 
     def _select_path(self, path: str) -> None:
         iterator = self.tree.findItems("", Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchRecursive)
@@ -403,15 +426,15 @@ class SpaceEditorDialog(ThemedDialog):
         marker = " ●" if file.path in self._dirty_paths else ""
         if file.binary:
             state = "已嵌入" if file.data else "未嵌入"
-            item.setText(
-                0, f"{file.name}   二进制 · {human_bytes(file.size)} · {state}{marker}"
+            meta = f"二进制 · {human_bytes(file.size)} · {state}{marker}"
+        else:
+            meta = (
+                f"{get_language(file.language).name} · "
+                f"{human_bytes(file.computed_size)}{marker}"
             )
-            return
-        item.setText(
-            0,
-            f"{file.name}   {get_language(file.language).name} · "
-            f"{human_bytes(file.computed_size)}{marker}",
-        )
+        item.setText(0, file.name)
+        item.setText(1, meta)
+        self._decorate_meta(item)
 
     def _refresh_ratio(self) -> None:
         probe = Space(files=self._files())
@@ -521,6 +544,70 @@ class SpaceEditorDialog(ThemedDialog):
                 f"成功导入 {added} 个, 跳过 {len(skipped)} 个:\n\n" + "\n".join(skipped[:10]),
             )
 
+    def import_directory(self) -> None:
+        """把一整个目录 (含全部子文件夹) 打包进这个空间。
+
+        用的是和主窗口同一个 :class:`DirectoryImportDialog` —— 先扫描出完整计划给用户
+        过目, 确认后照着**同一份计划**读文件, 直接写进对话框的工作副本 (点保存才落库)。
+        """
+        dialog = DirectoryImportDialog(
+            self,
+            theme=self._theme,
+            target_dir=self._selected_directory(),
+            budget_left=max(
+                0, MAX_SPACE_BINARY_BYTES
+                - sum(f.size for f in self._files() if f.binary and f.data)
+            ),
+            import_label="加入",
+        )
+        if dialog.exec() != DirectoryImportDialog.DialogCode.Accepted:
+            return
+        scan = dialog.scan()
+        if scan is None or scan.error or not scan.included:
+            return
+
+        added = 0
+        skipped: List[str] = []
+        for planned in scan.included:
+            try:
+                with open(planned.source, "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                skipped.append(f"{planned.path}: {exc.strerror or exc}")
+                continue
+            if planned.binary:
+                file = ProjectFile(path=planned.path, binary=True)
+                file.set_bytes(raw)
+            else:
+                body = decode_text(raw)
+                if body is None:
+                    file = ProjectFile(path=planned.path, binary=True)
+                    file.set_bytes(raw)
+                else:
+                    file = ProjectFile(path=planned.path, content=body)
+            existing = self._work_files.get(planned.path)
+            if existing is not None:
+                file.note = existing.note
+            self._work_files[planned.path] = file
+            self._dirty_paths.add(planned.path)
+            added += 1
+
+        self._refresh_tree()
+        self._refresh_ratio()
+        summary = (
+            f"已加入 {added} 个文件 · {human_bytes(scan.total_bytes)}"
+            + (f" · 跳过 {len(scan.skipped)} 个" if scan.skipped else "")
+        )
+        self.size_label.setText(summary + " —— 记得点「保存」才会写进代码库")
+        if skipped or scan.skipped:
+            lines = skipped[:8] + [f"{p.path} — {p.reason}" for p in scan.skipped[:8]]
+            QMessageBox.warning(
+                self,
+                "部分文件没有加入",
+                f"成功 {added} 个, 跳过 {len(scan.skipped) + len(skipped)} 个:\n\n"
+                + "\n".join(lines),
+            )
+
     def reimport_current(self) -> None:
         """重新选一个外部文件替换当前选中的二进制文件内容。"""
         data = self._current()
@@ -557,15 +644,32 @@ class SpaceEditorDialog(ThemedDialog):
     def add_directory(self, directory: str = "") -> None:
         base = directory or self._selected_directory()
         default = f"{base}/new_dir" if base else "new_dir"
-        text, ok = QInputDialog.getText(self, "新建目录", "目录路径 (用 / 分隔):", text=default)
-        if not ok:
+        dialog = NewDirectoryDialog(
+            self,
+            theme=self._theme,
+            default=default,
+            already_exists=lambda path: any(
+                p.startswith(path + "/") for p in self._work_files
+            ),
+        )
+        if dialog.exec() != NewDirectoryDialog.DialogCode.Accepted:
             return
-        directory = normalize_project_path(text)
-        if not directory:
+        path, use_placeholder = dialog.result_data()
+        if not path:
             QMessageBox.warning(self, "路径无效", "目录名不能为空。")
             return
+        if not use_placeholder:
+            # 不放占位文件的话, 空目录在容器里无法表达 —— 直接说明这一点
+            QMessageBox.information(
+                self,
+                "空目录不会保留",
+                f"已记住你的选择: 新建目录不再自动放 {PLACEHOLDER_NAME}。\n\n"
+                f"注意: {path}/ 现在是空的, 而容器只存文件 —— "
+                "在你往里面加文件之前, 这个目录不会出现在库里。",
+            )
+            return
         # 用一个占位文件把空目录"钉住" —— 容器里只存文件, 空目录本身无法表达
-        placeholder = f"{directory}/.gitkeep"
+        placeholder = f"{path}/{PLACEHOLDER_NAME}"
         if placeholder not in self._work_files:
             self._work_files[placeholder] = ProjectFile(path=placeholder, content="")
             self._dirty_paths.add(placeholder)
@@ -630,6 +734,7 @@ class SpaceEditorDialog(ThemedDialog):
         directory = data[1] if data and data[0] == "dir" else self._selected_directory()
         menu.addAction("新建文件…", lambda: self.add_file(directory))
         menu.addAction("导入文件…", lambda: self.import_files(directory))
+        menu.addAction("导入整个目录…", self.import_directory)
         menu.addAction("新建目录…", lambda: self.add_directory(directory))
         if data and data[0] == "file":
             menu.addSeparator()

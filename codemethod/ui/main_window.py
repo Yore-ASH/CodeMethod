@@ -54,9 +54,11 @@ from ..storage.container import BINARY_EXTENSIONS, TEXT_EXTENSIONS, human_size
 from ..storage.database import Database, DatabaseError
 from .dialogs.about_dialog import AboutDialog
 from .dialogs.container_dialog import ContainerInfoDialog, VerifyResultDialog
+from .dialogs.directory_import import DirectoryImportDialog
 from .dialogs.entry_editor import EntryEditorDialog
 from .dialogs.function_editor import FunctionEditorDialog
 from .dialogs.implementation_dialog import ImplementationDialog
+from .dialogs.new_directory import PLACEHOLDER_NAME, NewDirectoryDialog
 from .dialogs.readme_search import ReadmeSearchDialog
 from .dialogs.space_editor import SpaceEditorDialog
 from .dialogs.tag_manager import TagManagerDialog
@@ -313,6 +315,12 @@ class MainWindow(QMainWindow):
             tip="在代码库内新建一个完整项目 (所有文件都存进同一个 .cmdb)",
         )
         self.act_edit_space = self._act("编辑空间", lambda: self.edit_space(), shortcut="Ctrl+Shift+O")
+        self.act_import_directory = self._act(
+            "把整个目录打包进空间…",
+            self.import_directory_into_space,
+            shortcut="Ctrl+Shift+I",
+            tip="选一个目录, 连同全部子文件夹一起嵌进空间 (先预览再导入)",
+        )
         self.act_new_function = self._act(
             "新建函数体", self.new_function, shortcut="Ctrl+Shift+F",
             tip="写一个特定语言的函数, 自动检测变量并要求填写含义",
@@ -488,6 +496,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_save_as)
         file_menu.addSeparator()
         file_menu.addAction(self.act_import)
+        file_menu.addAction(self.act_import_directory)
         export_menu = file_menu.addMenu("导出")
         export_menu.addAction(self.act_export_md)
         export_menu.addAction(self.act_export_json)
@@ -581,6 +590,7 @@ class MainWindow(QMainWindow):
         bar.addAction(self.act_open)
         bar.addAction(self.act_save)
         bar.addSeparator()
+        bar.addAction(self.act_import_directory)
         bar.addAction(self.act_readme_search)
         bar.addAction(self.act_copy_code)
         bar.addAction(self.act_manage_tags)
@@ -670,6 +680,7 @@ class MainWindow(QMainWindow):
         self.space_panel.purge_requested.connect(lambda _id: self.purge_entry())
         self.space_panel.import_files_requested.connect(self.import_space_files)
         self.space_panel.export_file_requested.connect(self.export_space_file)
+        self.space_panel.remove_placeholder_requested.connect(self.remove_space_placeholder)
         self.detail_panel.restore_requested.connect(lambda _id: self.restore_entry())
         self.detail_panel.purge_requested.connect(lambda _id: self.purge_entry())
 
@@ -701,6 +712,7 @@ class MainWindow(QMainWindow):
             self.db.repository.all_tags(include_deleted=False),
             self.db.repository.tag_usage(),
             colors,
+            detail=self.db.repository.tag_usage_by_kind(),
         )
 
     def refresh_list(self, *, select_id: str = "", sync_detail: bool = True) -> None:
@@ -1555,37 +1567,73 @@ class MainWindow(QMainWindow):
             return
         self._embed_external(space.id, chosen, base_dir="", target_dir=directory)
 
+    def import_directory_into_space(self, space_id: str = "") -> None:
+        """「把整个目录打包进空间」的统一入口 (菜单 / 工具栏 / 详情面板都走这里)。
+
+        没有指定空间时, 按当前选中项推断; 推断不出来就**让用户挑一个** ——
+        这个功能不该因为"当前选中的是模块"就用不了。
+        """
+        target = space_id or ""
+        if not target:
+            item = self._current_item()
+            if getattr(item, "kind", "") == "space":
+                target = item.id
+        if not target:
+            spaces = [s for s in self.db.repository.spaces.values() if not s.deleted]
+            if not spaces:
+                answer = QMessageBox.question(
+                    self,
+                    "还没有空间",
+                    "整目录导入需要先有一个空间来承载。\n\n现在新建一个吗?",
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                self.new_space()
+                return
+            labels = [f"{s.display_title}  ({len(s.files)} 个文件)" for s in spaces]
+            label, ok = QInputDialog.getItem(
+                self, "选择目标空间", "把整个目录打包进哪个空间:", labels, 0, False
+            )
+            if not ok:
+                return
+            target = spaces[labels.index(label)].id
+        self.import_space_directory(target)
+
     def import_space_directory(self, space_id: str) -> None:
-        """导入整个外部目录 (保留子目录结构)。"""
+        """把一整个外部目录 (含全部子文件夹) 打包进空间。
+
+        先用 :class:`DirectoryImportDialog` 把计划完整摊给用户看 (多少文件、多少字节、
+        哪些会被跳过以及为什么), 确认后直接用**同一份计划**执行, 不再重复扫描。
+        """
         space = self._require_space(space_id)
         if space is None:
             return
-        directory = QFileDialog.getExistingDirectory(
-            self, "选择要导入的目录 (会保留子目录结构)", ""
-        )
-        if not directory:
-            return
-        answer = QMessageBox.question(
+        dialog = DirectoryImportDialog(
             self,
-            "导入整个目录",
-            f"把 {directory} 里的全部文件复制进《{space.display_title}》吗?\n\n"
-            "文件内容会被**完整嵌入** .cmdb (二进制也一样), 之后不再依赖原目录。\n"
-            "跳过 .git / __pycache__ / .venv。",
+            theme=self.theme,
+            budget_left=space.binary_budget_left(),
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if dialog.exec() != DirectoryImportDialog.DialogCode.Accepted:
+            return
+        scan = dialog.scan()
+        if scan is None or scan.error or not scan.included:
             return
         try:
-            report = self.db.repository.import_external_directory(space.id, directory)
+            report = self.db.repository.import_scan(space.id, scan, force=dialog.force())
         except RepositoryError as exc:
             self.show_error("导入目录失败", str(exc))
             return
+        self.set_kind_filter("all")
+        self._current_entry_id = space.id
+        self._current_kind = "space"
         self.refresh_all(select_id=space.id)
-        message = f"已从 {Path(directory).name}/ 导入: {report.summary()}"
-        self.set_status(message)
+        self.set_status(
+            f"已把 {Path(scan.root).name}/ 打包进《{space.display_title}》: {report.summary()}"
+        )
         if report.skipped:
             QMessageBox.warning(
                 self,
-                "部分文件未导入",
+                "部分文件没有导入",
                 f"成功 {report.changed} 个, 跳过 {len(report.skipped)} 个:\n\n"
                 + "\n".join(f"{p} — {why}" for p, why in report.skipped[:12]),
             )
@@ -1639,17 +1687,67 @@ class MainWindow(QMainWindow):
         space = self._require_space(space_id)
         if space is None:
             return
-        text, ok = QInputDialog.getText(self, "新建目录", "目录路径 (用 / 分隔):", text="src")
-        if not ok or not text.strip():
+        dialog = NewDirectoryDialog(
+            self,
+            theme=self.theme,
+            default="src",
+            already_exists=lambda path: any(
+                f.path.startswith(path + "/") for f in space.files
+            ),
+        )
+        if dialog.exec() != NewDirectoryDialog.DialogCode.Accepted:
             return
-        placeholder = f"{normalize_project_path(text)}/.gitkeep"
+        directory, use_placeholder = dialog.result_data()
+        if not directory:
+            return
+        if not use_placeholder:
+            QMessageBox.information(
+                self,
+                "空目录不会保留",
+                f"已记住你的选择: 新建目录不再自动放 {PLACEHOLDER_NAME}。\n\n"
+                "容器只存文件, 所以往这个目录里加文件之前, 它不会出现在库里。",
+            )
+            return
+        placeholder = f"{directory}/{PLACEHOLDER_NAME}"
         try:
             self.db.repository.put_space_file(space.id, placeholder, "")
         except RepositoryError as exc:
             self.show_error("新建目录失败", str(exc))
             return
         self.refresh_all(select_id=space.id)
+        self.space_panel.show_file(placeholder)
         self.set_status(f"已新建目录 (占位文件 {placeholder})")
+
+    def remove_space_placeholder(self, space_id: str, path: str) -> None:
+        """删掉目录里的 .gitkeep 占位文件 (用户说这是"去留"的另一半)。"""
+        space = self._require_space(space_id)
+        if space is None:
+            return
+        directory = normalize_project_path(path)
+        placeholder = f"{directory}/{PLACEHOLDER_NAME}" if directory else PLACEHOLDER_NAME
+        file = space.get_file(placeholder)
+        if file is None:
+            self.set_status(f"{directory}/ 里没有 {PLACEHOLDER_NAME}")
+            return
+        siblings = [
+            f for f in space.files
+            if f.path.startswith(f"{directory}/" if directory else "") and f.path != placeholder
+        ]
+        warning = (
+            f"{directory}/ 里还有 {len(siblings)} 个文件, 删掉占位文件后目录仍然存在。"
+            if siblings
+            else f"⚠ {directory}/ 里**没有其它文件**, 删掉占位文件后这个空目录就会消失。"
+        )
+        answer = QMessageBox.question(
+            self,
+            f"删除 {PLACEHOLDER_NAME}",
+            f"确定删除 {placeholder} 吗?\n\n{warning}\n\n改动会进入历史, 可以回滚。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.db.repository.delete_space_file(space.id, placeholder)
+        self.refresh_all(select_id=space.id)
+        self.set_status(f"已删除占位文件 {placeholder}")
 
     def rename_space_file(self, space_id: str, path: str) -> None:
         space = self._require_space(space_id)

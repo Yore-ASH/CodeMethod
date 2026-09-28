@@ -13,7 +13,7 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.*=false")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from PySide6.QtCore import QSettings, qInstallMessageHandler
+    from PySide6.QtCore import QSettings, Qt, qInstallMessageHandler
     from PySide6.QtGui import QColor, QTextDocument
     from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
@@ -1438,11 +1438,22 @@ class TestEmbeddedBinaryUI(_TrackedWidgets):
             item = stack.pop()
             if item is None:
                 continue
-            texts.append(item.text(0))
+            # 文件名在第 0 列, 类型/大小/嵌入状态在第 1 列 (颜色更淡)
+            texts.append(f"{item.text(0)}|{item.text(1)}")
             stack.extend(item.child(i) for i in range(item.childCount()))
         joined = " | ".join(texts)
         self.assertIn("已嵌入", joined)
         self.assertIn("未嵌入", joined)
+        # 没有文件的那一列不该是同一种颜色
+        for item in window.space_panel.tree.findItems(
+            "", Qt.MatchFlag.MatchContains | Qt.MatchFlag.MatchRecursive
+        ):
+            if item.text(1):
+                self.assertNotEqual(
+                    item.foreground(1).color().name(),
+                    window.space_panel.tree.palette().text().color().name(),
+                )
+                break
         window.close()
 
     def test_space_editor_imports_binary(self):
@@ -1531,9 +1542,7 @@ class TestEmbeddedBinaryUI(_TrackedWidgets):
         with tempfile.TemporaryDirectory() as tmp:
             db = Database.create()
             space = db.repository.create_space("导出")
-            db.repository.put_space_file(
-                space.id, "logo.png", binary_data=self.FAKE_PNG
-            )
+            db.repository.put_space_file(space.id, "logo.png", binary_data=self.FAKE_PNG)
             window = self.track(MainWindow(db))
             window.show()
             window.entry_list.select_entry(space.id)
@@ -1549,6 +1558,194 @@ class TestEmbeddedBinaryUI(_TrackedWidgets):
             self.assertTrue(target.exists())
             self.assertEqual(target.read_bytes(), self.FAKE_PNG)
             window.close()
+
+
+@unittest.skipUnless(PYSIDE, "需要 PySide6")
+class TestDirectoryPackagingUI(_TrackedWidgets):
+    """整目录打包的界面: 预览对话框 + 空间编辑器里的入口。"""
+
+    def _project(self, root):
+        from pathlib import Path
+
+        base = Path(root)
+        (base / "src" / "utils").mkdir(parents=True)
+        (base / ".git").mkdir()
+        (base / "src" / "main.py").write_bytes(b"print(1)\n")
+        (base / "src" / "utils" / "h.py").write_bytes(b"def h():\n    return 1\n")
+        (base / ".git" / "config").write_bytes(b"[core]\n")
+        (base / "README.md").write_bytes(b"# hi\n")
+        return base
+
+    def test_dialog_previews_the_plan(self):
+        import tempfile
+
+        from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(tmp)
+            dialog = self.track(DirectoryImportDialog(theme=get_theme("dark+")))
+            dialog.path_edit.setText(str(root))
+            self.app.processEvents()
+
+            scan = dialog.scan()
+            self.assertIsNotNone(scan)
+            self.assertFalse(scan.error)
+            self.assertEqual(
+                {f.path for f in scan.included},
+                {"README.md", "src/main.py", "src/utils/h.py"},
+            )
+            # 摘要与"整个目录被跳过"的提示都要显示出来
+            self.assertIn("3", dialog.summary_label.text())
+            self.assertIn(".git", dialog.warning_label.text())
+            self.assertTrue(dialog.import_button.isEnabled())
+            # 预览树里应该有被划掉的 .git 目录
+            rows = []
+            stack = [dialog.tree.topLevelItem(i) for i in range(dialog.tree.topLevelItemCount())]
+            while stack:
+                item = stack.pop()
+                if item is None:
+                    continue
+                rows.append((item.text(0), item.text(2)))
+                stack.extend(item.child(i) for i in range(item.childCount()))
+            self.assertTrue(any(name == ".git/" and "跳过" in meta for name, meta in rows), rows)
+
+    def test_dialog_options_change_the_plan(self):
+        import tempfile
+
+        from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(tmp)
+            dialog = self.track(DirectoryImportDialog(theme=get_theme("dark+")))
+            dialog.path_edit.setText(str(root))
+            self.app.processEvents()
+            self.assertEqual(len(dialog.scan().included), 3)
+
+            dialog.vcs_check.setChecked(True)
+            self.app.processEvents()
+            self.assertEqual(len(dialog.scan().included), 4)
+
+            dialog.recursive_check.setChecked(False)
+            self.app.processEvents()
+            # 不递归时只扫目标目录本身, 子目录完全不进去
+            self.assertEqual({f.path for f in dialog.scan().included}, {"README.md"})
+
+    def test_dialog_blocks_when_budget_is_short_until_forced(self):
+        import tempfile
+
+        from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(tmp)
+            dialog = self.track(
+                DirectoryImportDialog(theme=get_theme("dark+"), budget_left=0)
+            )
+            dialog.path_edit.setText(str(root))
+            self.app.processEvents()
+            # 对话框没 show 时 isVisible() 恒为 False, 用 isHidden() 看显式可见性
+            self.assertTrue(dialog.force_check.isHidden())
+            self.assertTrue(dialog.import_button.isEnabled())
+
+            # 放一张大图, 预算 0 → 必须勾「仍然导入」才允许
+            from pathlib import Path
+
+            blob = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 8
+            (Path(root) / "big.png").write_bytes(blob)
+            dialog.rescan()
+            self.app.processEvents()
+            self.assertFalse(dialog.force_check.isHidden())
+            self.assertFalse(dialog.import_button.isEnabled())
+            self.assertIn("仍然导入", dialog.warning_label.text().replace("&nbsp;", " "))
+            dialog.force_check.setChecked(True)
+            self.app.processEvents()
+            self.assertTrue(dialog.import_button.isEnabled())
+
+    def test_dialog_reports_missing_directory(self):
+        from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
+
+        dialog = self.track(DirectoryImportDialog(theme=get_theme("dark+")))
+        dialog.path_edit.setText("Z:/definitely/not/here")
+        self.app.processEvents()
+        self.assertTrue(dialog.scan().error)
+        self.assertFalse(dialog.import_button.isEnabled())
+
+    def test_space_editor_has_directory_import(self):
+        from PySide6.QtWidgets import QPushButton
+
+        from codemethod.core.spaces import ProjectFile
+        from codemethod.ui.dialogs.space_editor import SpaceEditorDialog
+
+        dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+        labels = [b.text() for b in dialog.findChildren(QPushButton)]
+        self.assertTrue(any("导入目录" in text for text in labels), labels)
+        self.assertTrue(any("导入文件" in text for text in labels), labels)
+        # 工作副本里的目录结构要被保留
+        dialog._work_files["src/a.py"] = ProjectFile(path="src/a.py", content="1")
+        dialog._work_files["docs/b.md"] = ProjectFile(path="docs/b.md", content="2")
+        dialog._refresh_tree()
+        files = {f.path for f in dialog.result_data()["files"]}
+        self.assertEqual(files, {"src/a.py", "docs/b.md"})
+
+    def test_space_editor_tree_has_two_columns(self):
+        from codemethod.core.spaces import ProjectFile
+        from codemethod.ui.dialogs.space_editor import SpaceEditorDialog
+
+        dialog = self.track(SpaceEditorDialog(theme=get_theme("dark+")))
+        dialog._work_files["src/a.py"] = ProjectFile(path="src/a.py", content="print(1)")
+        dialog._refresh_tree()
+        self.assertEqual(dialog.tree.columnCount(), 2)
+        item = dialog.tree.topLevelItem(0).child(0) if dialog.tree.topLevelItem(0) else None
+        while item is not None and item.childCount():
+            item = item.child(0)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.text(0), "a.py")
+        self.assertIn("Python", item.text(1))
+        self.assertNotEqual(item.foreground(1).color().name(), "#000000")
+
+    def test_main_window_import_directory_menu_action(self):
+        import tempfile
+        from unittest import mock
+
+        from codemethod.ui.dialogs.directory_import import DirectoryImportDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(tmp)
+            db = Database.create()
+            space = db.repository.create_space("打包")
+            window = self.track(MainWindow(db))
+            window.show()
+            window.entry_list.select_entry(space.id)
+            window.refresh_detail()
+            self.app.processEvents()
+
+            def fake_exec(dialog_self):
+                dialog_self.path_edit.setText(str(root))
+                self.app.processEvents()
+                return DirectoryImportDialog.DialogCode.Accepted
+
+            with mock.patch.object(DirectoryImportDialog, "exec", fake_exec):
+                window.import_directory_into_space()
+            self.app.processEvents()
+
+            paths = {f.path for f in db.repository.require_space(space.id).files}
+            self.assertIn("src/main.py", paths)
+            self.assertNotIn(".git/config", paths)
+            window.close()
+
+    def test_gitkeep_preference_roundtrip(self):
+        from codemethod.ui.dialogs.new_directory import (
+            placeholder_preference,
+            set_placeholder_preference,
+        )
+
+        original = placeholder_preference()
+        try:
+            set_placeholder_preference(False)
+            self.assertFalse(placeholder_preference())
+            set_placeholder_preference(True)
+            self.assertTrue(placeholder_preference())
+        finally:
+            set_placeholder_preference(original)
 
 
 if __name__ == "__main__":

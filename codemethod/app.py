@@ -762,6 +762,86 @@ def run_self_test(report_path: Optional[str] = None) -> int:
         expected_rows = stats["modules"] + stats["spaces"] + stats["functions"]
         check("主窗口构建", rows == expected_rows, f"列表 {rows} 行 / 期望 {expected_rows}")
 
+        # ---- 整目录打包: 扫描计划 → 照着计划导入 ----
+        from .core.spaces import ImportOptions, scan_external_directory
+
+        project = os.path.join(tmp, "packme")
+        os.makedirs(os.path.join(project, "src", "utils"), exist_ok=True)
+        os.makedirs(os.path.join(project, ".git", "objects"), exist_ok=True)
+        os.makedirs(os.path.join(project, "__pycache__"), exist_ok=True)
+        with open(os.path.join(project, "README.md"), "wb") as handle:
+            handle.write("# packme\n中文说明\n".encode("utf-8"))
+        with open(os.path.join(project, "src", "main.py"), "wb") as handle:
+            handle.write(b"print(1)\n")
+        with open(os.path.join(project, "src", "utils", "h.py"), "wb") as handle:
+            handle.write(b"def h():\n    return 1\n")
+        with open(os.path.join(project, ".git", "objects", "ab"), "wb") as handle:
+            handle.write(b"\x00\x01")
+        with open(os.path.join(project, "__pycache__", "m.pyc"), "wb") as handle:
+            handle.write(b"\x00\x00")
+        os.makedirs(os.path.join(project, "assets"), exist_ok=True)
+        with open(os.path.join(project, "assets", "logo.png"), "wb") as handle:
+            handle.write(DEMO_PNG)
+
+        pack_scan = scan_external_directory(project, ImportOptions())
+        check(
+            "整目录扫描保留子目录结构",
+            {f.path for f in pack_scan.included}
+            == {"README.md", "src/main.py", "src/utils/h.py", "assets/logo.png"},
+            "、".join(sorted(f.path for f in pack_scan.included)),
+        )
+        check(
+            "整目录扫描跳过 .git / __pycache__ 并说明原因",
+            {path for path, _r in pack_scan.pruned_dirs} >= {".git", "__pycache__"},
+            "、".join(f"{p}({r})" for p, r in pack_scan.pruned_dirs),
+        )
+        check(
+            "整目录扫描区分文本与二进制",
+            len(pack_scan.text_files) == 3 and len(pack_scan.binary_files) == 1,
+            pack_scan.summary(),
+        )
+        pack_space = repo.create_space("打包验证")
+        pack_report = repo.import_scan(pack_space.id, pack_scan)
+        packed = {f.path for f in repo.require_space(pack_space.id).files}
+        check(
+            "照着计划导入的结果与计划一致",
+            packed == {f.path for f in pack_scan.included} and pack_report.added == 4,
+            f"{pack_report.added} 个文件",
+        )
+        check(
+            "打包后二进制字节一致",
+            repo.require_space(pack_space.id).get_file("assets/logo.png").raw_bytes() == DEMO_PNG,
+        )
+        check(
+            "打包只产生一条修订",
+            repo.revisions(pack_space.id)[0].action == "file_add"
+            and "打包导入" in repo.revisions(pack_space.id)[0].summary,
+            repo.revisions(pack_space.id)[0].summary,
+        )
+        from unittest import mock as _mock
+
+        with _mock.patch("codemethod.core.spaces.MAX_SPACE_BINARY_BYTES", 1):
+            try:
+                repo.import_scan(pack_space.id, pack_scan)
+                check("超预算时拒绝打包", False, "竟然没报错")
+            except Exception as exc:
+                check("超预算时拒绝打包", "只剩" in str(exc), str(exc).splitlines()[0])
+            forced = repo.import_scan(pack_space.id, pack_scan, force=True)
+            check("显式确认后可以越过软上限", forced.changed > 0, forced.summary())
+        repo.delete_item(pack_space.id, hard=True)
+
+        # ---- 标签统计必须覆盖三类实体 ----
+        tag_probe = Repository(name="tagprobe")
+        tag_probe.create_entry("m", "d", "p", ["shared"])
+        tag_probe.create_space("s", "d", "p", ["shared", "space-only"])
+        tag_probe.create_function("f", "python", "def f():\n    return 1\n", tags=["shared"])
+        usage = tag_probe.tag_usage()
+        check(
+            "标签统计覆盖模块/空间/函数体",
+            usage.get("shared") == 3 and usage.get("space-only") == 1,
+            str(usage),
+        )
+
         # ---- 对话框必须放得进屏幕 (否则底部的「保存」会跑到屏幕外) ----
         from .ui.layout_util import SCREEN_MARGIN, available_geometry, clamp_size
 

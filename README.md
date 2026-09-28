@@ -160,9 +160,22 @@ python -m unittest discover -s tests -t .
   - 树里会标注 `已嵌入` / `未嵌入`;
 - 还可以**导入整个目录** (`⋯ → 导入整个目录…`), 自动跳过 `.git` / `__pycache__` / `.venv`
   并保留子目录结构;
+- 还可以**把一整个目录连同全部子文件夹打包进空间** (`Ctrl+Shift+I`, 或空间详情的
+  `⋯ → 导入整个目录…`, 或空间编辑器里的「导入目录…」按钮):
+  - 先**扫描出完整计划**给你过目, 而不是闷头导入: 多少个文件、多少字节、其中文本多少、
+    二进制多少、哪些会被跳过**以及为什么**; 预览树里跳过的项目直接划掉;
+  - 可以勾选**包含隐藏文件** / **包含版本控制目录** (`.git` 等) / **包含缓存目录**
+    (`node_modules`、`__pycache__`、`.venv` …), 默认跳过后两类 —— 它们通常能让库膨胀好几倍;
+  - `.pyc` / `.o` / `.class` 这类编译产物始终跳过 (没有保留价值);
+  - 还能指定**放到空间里的哪个目录** (例如 `vendor/lib/`), 或取消「保留目录结构」把文件平铺;
+  - 空间二进制余量不够时会**拦住**并说明差多少, 确认后可以「仍然导入」(软上限);
+  - 确认后直接用**同一份计划**执行, 不会重复扫描; 整批导入只产生**一条**修订。
 - 双击文本文件在右侧编辑器里改内容, 顶部会实时显示行数与字节数;
 - 文件用**相对路径**标识, 目录结构由路径推导 —— 不需要单独维护一棵树;
-- 空目录用一个 `.gitkeep` 占位文件钉住 (容器里只存文件);
+- 项目树分**两列**: 第 0 列是文件名 (正常颜色), 第 1 列用**淡化颜色 + 右对齐**显示
+  语言/类型与大小 —— 两者同色挤在一行会显得很乱;
+- 空目录用一个 `.gitkeep` 占位文件钉住 (容器里只存文件, 空目录本身无法表达);
+  新建目录时会**明确问你**要不要放, 并记住你的选择, 目录右键也能随时删掉它;
 - 上限: 单个文本文件 **2 MB**、单个二进制文件 **4 MB**、单个空间嵌入的二进制总量 **32 MB**、
   单个空间 **2000** 个文件;
 - 旧版本保存的"只有大小"的二进制文件仍然能打开, 树里显示 `未嵌入`, 点「重新导入…」
@@ -291,6 +304,8 @@ Rust 版要 cargo。因此前置要求分两层:
 ### 查找
 
 - 左侧标签面板: 勾选任意多个标签, 选择 **同时包含 (AND) / 包含任一 (OR) / 排除所选 (NOT) / 恰好等于 (EXACT)**;
+  每个标签后面是**真实使用次数** (覆盖模块 / 空间 / 函数体三类实体), 悬停还能看到
+  「模块 4 · 空间 1 · 函数体 1」这样的明细; 只有**从未使用**的标签才会以斜体显示;
 - 全文检索: 覆盖标题、标签、描述、前置要求、备注、文件名与**全部源代码**
   (空间会搜到每个文件的内容, 含 README), 可以按需关闭代码/描述范围;
 - 字段限定符: `tag:` / `lang:` / `status:` / `kind:` / `prereq:` / `readme:` / `file:` / `is:`;
@@ -631,11 +646,12 @@ CodeMethod/
 │       │                       entry_list (模型+委托), detail_panel, history_panel,
 │       │                       language_bar (占比条), action_button (按钮防截断),
 │       │                       deleted_notice (回收站提示条), binary_preview (图片/十六进制),
-│       │                       space_detail, function_detail (多语言 + 变量表)
+│       │                       space_detail (两列项目树), function_detail (多语言 + 变量表)
 │       └── dialogs/            entry_editor, implementation_dialog, space_editor,
+│                               directory_import (整目录打包预览), new_directory (.gitkeep 选择),
 │                               function_editor (多语言实现编辑), readme_search,
 │                               tag_manager, container_dialog, about
-├── tests/                      498 个单元测试 (unittest, 无需显示器)
+├── tests/                      529 个单元测试 (unittest, 无需显示器)
 ├── codemethod.spec             PyInstaller 打包配置
 ├── build.py / build.ps1 / build.bat   一键构建脚本
 ├── pyproject.toml              打包元数据与安装配置
@@ -663,7 +679,7 @@ codemethod --demo          # 安装后可直接运行
 .\build.ps1                    # 单文件 dist\CodeMethod.exe
 .\build.ps1 -OneDir            # 目录版 dist\CodeMethod\ (启动更快)
 .\build.ps1 -All -Zip          # 两种都构建, 并额外产出分发包 zip
-.\build.ps1 -Tests -Clean      # 先跑 498 个测试并清理旧产物
+.\build.ps1 -Tests -Clean      # 先跑 529 个测试并清理旧产物
 ```
 
 或者直接用 Python / 批处理:
@@ -704,13 +720,15 @@ spec 里主动排除了 WebEngine / 3D / Multimedia / Quick 等用不到的 Qt �
 dist\CodeMethod.exe --selftest report.txt
 ```
 
-它会在离屏模式下跑完 **72 项**检查并写报告:
+它会在离屏模式下跑完 **81 项**检查并写报告:
 
 - 22 种语言注册表与**每种语言的语法高亮**都能产出 token;
 - `.cmdb` / `.cmj` 容器的**写入、读回、完整性校验**(CRC32 / SHA-256);
 - Markdown / JSON / ZIP 三种导出与 ZIP 回读 (**二进制还原成原始字节**);
 - 主窗口构建、条目列表、**多语言页签**、代码视图挂载 (覆盖 Qt 平台插件是否被正确打包);
 - 空间里的**二进制嵌入** (`raw_bytes()` 与源文件逐字节一致) 与二进制预览页;
+- **整目录打包** (扫描出的计划与实际导入一致、跳过 `.git` / `__pycache__` 并说明原因、
+  超预算时拒绝) 与**标签计数覆盖三类实体**;
 - **对话框尺寸夹取** —— 保证「保存」不会跑到屏幕外。
 
 全部通过时退出码为 `0`。`build.py` 在每次构建后都会自动调用它, 所以"构建成功"
@@ -750,7 +768,7 @@ dist\CodeMethod.exe --selftest report.txt
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -t .     # 498 个测试
+python -m unittest discover -s tests -t .     # 529 个测试
 python -m pytest                              # 也兼容 pytest
 ```
 

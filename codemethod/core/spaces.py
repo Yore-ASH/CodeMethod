@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import os
 import posixpath
 import time
 from dataclasses import dataclass, field
@@ -53,6 +54,23 @@ MAX_FILE_BYTES = 2 * 1024 * 1024      # 单文件文本内容上限, 防止库�
 MAX_BINARY_BYTES = 4 * 1024 * 1024    # 单个二进制文件的嵌入上限
 MAX_SPACE_BINARY_BYTES = 32 * 1024 * 1024   # 单个空间里全部嵌入二进制的总量上限
 MAX_FILES_PER_SPACE = 2000
+
+# 导入整个目录时**默认跳过**的目录名 (可以在对话框里勾上"全部包含")
+VCS_DIR_NAMES = frozenset({".git", ".svn", ".hg", ".bzr", "CVS"})
+CACHE_DIR_NAMES = frozenset(
+    {
+        "__pycache__", ".venv", "venv", "env", "node_modules", ".mypy_cache",
+        ".pytest_cache", ".ruff_cache", ".tox", ".gradle", ".idea", ".vs",
+        "target", "dist", "build", ".next", ".nuxt", "vendor",
+    }
+)
+# 导入整个目录时**默认跳过**的文件后缀 (编译产物 / 缓存 / 编辑器临时文件)
+SKIP_FILE_SUFFIXES = frozenset(
+    {
+        ".pyc", ".pyo", ".pyd", ".class", ".o", ".obj", ".pdb", ".ilk",
+        ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", ".DS_Store",
+    }
+)
 
 # 十六进制预览一次取多少字节
 HEX_PREVIEW_BYTES = 512
@@ -130,6 +148,294 @@ def hex_dump(data: bytes, *, limit: int = HEX_PREVIEW_BYTES, base_offset: int = 
             f"(共 {human_bytes(len(data))})"
         )
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------
+# 整目录导入: 先"计划", 再执行
+# --------------------------------------------------------------------------------------
+#
+# 把一整个目录 (含子目录) 打包进空间是个**破坏性**操作: 几百上千个文件、几 MB 大图、
+# 一堆 .git 内部对象。所以这里把过程拆成两步:
+#
+#   1. ``scan_external_directory`` 只**读目录结构与每个文件的前几 KB**,
+#      为每个文件算出一条计划 (库内路径 / 大小 / 文本还是二进制 / 是否跳过);
+#   2. ``Repository.import_scan`` 照着计划执行。
+#
+# 界面因此可以先给出**准确的预览** (多少文件、多少字节、哪些会被跳过、为什么),
+# 用户确认后不再重复扫描。
+
+
+@dataclass
+class ImportOptions:
+    """整目录导入的选项 (界面上的那几个勾选框)。"""
+
+    recursive: bool = True
+    include_hidden: bool = True          # 包含 .gitignore / .env 这类隐藏文件
+    include_vcs: bool = False            # 包含 .git / .svn / .hg
+    include_caches: bool = False         # 包含 __pycache__ / node_modules / .venv …
+    keep_structure: bool = True          # 保留子目录结构 (否则全部平铺到根)
+    target_dir: str = ""                 # 全部落到空间里的哪个目录下
+    max_text_bytes: int = MAX_FILE_BYTES
+    max_binary_bytes: int = MAX_BINARY_BYTES
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "recursive": self.recursive,
+            "include_hidden": self.include_hidden,
+            "include_vcs": self.include_vcs,
+            "include_caches": self.include_caches,
+            "keep_structure": self.keep_structure,
+            "target_dir": self.target_dir,
+            "max_text_bytes": self.max_text_bytes,
+            "max_binary_bytes": self.max_binary_bytes,
+        }
+
+
+@dataclass
+class PlannedFile:
+    """一个待导入文件在计划里的样子 (``reason`` 非空表示会被跳过)。"""
+
+    source: str = ""             # 磁盘上的绝对路径
+    path: str = ""               # 库内相对路径
+    size: int = 0
+    binary: bool = False         # 按二进制嵌入 (否则按文本存)
+    reason: str = ""             # 跳过原因; 空字符串 = 会导入
+
+    @property
+    def skipped(self) -> bool:
+        return bool(self.reason)
+
+    @property
+    def name(self) -> str:
+        return posixpath.basename(self.path)
+
+    @property
+    def size_label(self) -> str:
+        return human_bytes(self.size)
+
+    @property
+    def kind_label(self) -> str:
+        return "二进制" if self.binary else "文本"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.source,
+            "path": self.path,
+            "size": self.size,
+            "binary": self.binary,
+            "reason": self.reason,
+            "skipped": self.skipped,
+        }
+
+
+@dataclass
+class DirectoryScan:
+    """一次整目录扫描的结果 —— 目录树 + 每个文件的计划。"""
+
+    root: str = ""
+    files: List[PlannedFile] = field(default_factory=list)
+    options: ImportOptions = field(default_factory=ImportOptions)
+    error: str = ""                       # 扫描本身失败 (例如目录不存在)
+    # 整个被剪掉的目录: [(相对路径, 原因)]。文件级的跳过在 PlannedFile.reason 里,
+    # 但目录是在 os.walk 阶段就剪掉的 —— 不说出来的话, 用户会以为 .git "凭空消失"。
+    pruned_dirs: List[Tuple[str, str]] = field(default_factory=list)
+
+    # ---- 统计 ----
+    @property
+    def included(self) -> List[PlannedFile]:
+        return [f for f in self.files if not f.skipped]
+
+    @property
+    def skipped(self) -> List[PlannedFile]:
+        return [f for f in self.files if f.skipped]
+
+    @property
+    def text_files(self) -> List[PlannedFile]:
+        return [f for f in self.included if not f.binary]
+
+    @property
+    def binary_files(self) -> List[PlannedFile]:
+        return [f for f in self.included if f.binary]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(f.size for f in self.included)
+
+    @property
+    def text_bytes(self) -> int:
+        return sum(f.size for f in self.text_files)
+
+    @property
+    def binary_bytes(self) -> int:
+        return sum(f.size for f in self.binary_files)
+
+    @property
+    def directories(self) -> List[str]:
+        found: set = set()
+        for item in self.included:
+            directory = posixpath.dirname(item.path)
+            while directory:
+                found.add(directory)
+                directory = posixpath.dirname(directory)
+        return sorted(found)
+
+    def reasons(self) -> Dict[str, int]:
+        """跳过原因 → 数量 (给界面做汇总)。"""
+        counts: Dict[str, int] = {}
+        for item in self.skipped:
+            counts[item.reason] = counts.get(item.reason, 0) + 1
+        return counts
+
+    def pruned_reasons(self) -> Dict[str, int]:
+        """被整目录剪掉的原因 → 目录数量。"""
+        counts: Dict[str, int] = {}
+        for _path, reason in self.pruned_dirs:
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        parts = [
+            f"{len(self.included)} 个文件 · {human_bytes(self.total_bytes)}",
+            f"文本 {len(self.text_files)} 个 ({human_bytes(self.text_bytes)})",
+            f"二进制 {len(self.binary_files)} 个 ({human_bytes(self.binary_bytes)})",
+        ]
+        if self.skipped:
+            parts.append(f"跳过 {len(self.skipped)} 个文件")
+        if self.pruned_dirs:
+            parts.append(f"跳过 {len(self.pruned_dirs)} 个目录")
+        return " · ".join(parts)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "root": self.root,
+            "summary": self.summary(),
+            "options": self.options.to_dict(),
+            "files": [f.to_dict() for f in self.files],
+            "pruned_dirs": [{"path": p, "reason": r} for p, r in self.pruned_dirs],
+        }
+
+
+def scan_external_directory(
+    directory: str, options: Optional[ImportOptions] = None
+) -> DirectoryScan:
+    """扫描一个外部目录, 产出"会导入哪些文件"的完整计划。
+
+    只读取**每个文件的前 8 KB** 来判断文本/二进制, 所以扫描几千个文件也很快,
+    且不会把大文件读进内存。
+    """
+    opts = options or ImportOptions()
+    root = os.path.abspath(str(directory or ""))
+    scan = DirectoryScan(root=root, options=opts)
+    if not os.path.isdir(root):
+        scan.error = f"目录不存在: {directory}"
+        return scan
+
+    target_prefix = normalize_project_path(opts.target_dir)
+    sources: List[str] = []
+    if opts.recursive:
+        for current, dirs, names in os.walk(root):
+            kept: List[str] = []
+            for name in sorted(dirs):
+                reason = _dir_skip_reason(name, opts)
+                if reason:
+                    scan.pruned_dirs.append(
+                        ((os.path.relpath(os.path.join(current, name), root)).replace(os.sep, "/"), reason)
+                    )
+                    continue
+                kept.append(name)
+            dirs[:] = kept
+            for name in sorted(names):
+                sources.append(os.path.join(current, name))
+    else:
+        for name in sorted(os.listdir(root)):
+            full = os.path.join(root, name)
+            if os.path.isfile(full):
+                sources.append(full)
+
+    for source in sources:
+        scan.files.append(_plan_one(source, root, target_prefix, opts))
+    return scan
+
+
+def _dir_skip_reason(name: str, opts: ImportOptions) -> str:
+    """整个目录该不该剪掉? 返回原因 (空串 = 保留)。"""
+    if name in VCS_DIR_NAMES and not opts.include_vcs:
+        return f"版本控制目录 ({name})"
+    if name in CACHE_DIR_NAMES and not opts.include_caches:
+        return f"缓存/产物目录 ({name})"
+    if name.startswith(".") and not opts.include_hidden:
+        return "隐藏目录"
+    return ""
+
+
+def _plan_one(
+    source: str, root: str, target_prefix: str, opts: ImportOptions
+) -> PlannedFile:
+    name = os.path.basename(source)
+    try:
+        size = os.path.getsize(source)
+    except OSError as exc:
+        return PlannedFile(source=source, path=name, reason=f"读不到大小: {exc.strerror or exc}")
+
+    if name.startswith(".") and not opts.include_hidden:
+        return PlannedFile(source=source, path=name, size=size, reason="隐藏文件")
+
+    relative = _relative_under(source, root, opts)
+    if not relative:
+        return PlannedFile(source=source, path=name, size=size, reason="路径无效")
+    path = normalize_project_path(f"{target_prefix}/{relative}" if target_prefix else relative)
+    if not path:
+        return PlannedFile(source=source, path=name, size=size, reason="路径无效")
+
+    suffix = posixpath.splitext(name)[1].lower()
+    if suffix in SKIP_FILE_SUFFIXES:
+        return PlannedFile(source=source, path=path, size=size, reason=f"缓存/临时文件 ({suffix})")
+
+    head = _read_head(source)
+    binary = is_binary_path(path) or looks_binary(head)
+
+    if binary:
+        if size > opts.max_binary_bytes:
+            return PlannedFile(
+                source=source, path=path, size=size, binary=True,
+                reason=f"超过二进制上限 {human_bytes(opts.max_binary_bytes)}",
+            )
+        return PlannedFile(source=source, path=path, size=size, binary=True)
+
+    if size > opts.max_text_bytes:
+        # 大文本文件改按二进制嵌入 —— 反正界面里也是只读预览,
+        # 这样"完全打包"就不会因为一个 3 MB 的日志文件而失败。
+        if size <= opts.max_binary_bytes:
+            return PlannedFile(source=source, path=path, size=size, binary=True)
+        return PlannedFile(
+            source=source, path=path, size=size,
+            reason=f"超过上限 {human_bytes(opts.max_binary_bytes)}",
+        )
+    return PlannedFile(source=source, path=path, size=size)
+
+
+def _relative_under(source: str, root: str, opts: ImportOptions) -> str:
+    """决定文件在库内的相对路径。"""
+    name = os.path.basename(source)
+    if not opts.keep_structure:
+        return name
+    try:
+        relative = os.path.relpath(source, root)
+    except ValueError:      # pragma: no cover - 跨盘符
+        return name
+    if relative.startswith(".."):      # pragma: no cover - 不该发生
+        return name
+    return relative.replace(os.sep, "/")
+
+
+def _read_head(source: str, limit: int = 8192) -> bytes:
+    try:
+        with open(source, "rb") as handle:
+            return handle.read(limit)
+    except OSError:      # pragma: no cover - 权限问题
+        return b""
 
 
 def normalize_project_path(path: str) -> str:
@@ -769,6 +1075,10 @@ __all__ = [
     "LanguageShare",
     "TreeNode",
     "ReadmeHit",
+    "ImportOptions",
+    "PlannedFile",
+    "DirectoryScan",
+    "scan_external_directory",
     "build_tree",
     "search_readmes",
     "normalize_project_path",
@@ -782,6 +1092,9 @@ __all__ = [
     "README_NAMES",
     "BINARY_EXTENSIONS",
     "IMAGE_EXTENSIONS",
+    "VCS_DIR_NAMES",
+    "CACHE_DIR_NAMES",
+    "SKIP_FILE_SUFFIXES",
     "MAX_FILE_BYTES",
     "MAX_BINARY_BYTES",
     "MAX_SPACE_BINARY_BYTES",

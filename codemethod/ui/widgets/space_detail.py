@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMenu,
     QPushButton,
@@ -41,20 +42,32 @@ from .tag_chip import TagChipBar
 
 
 class SpaceTree(QTreeWidget):
-    """项目结构树。双击文件请求打开。"""
+    """项目结构树。第 0 列是文件名, 第 1 列是**淡化颜色**的类型/大小/嵌入状态。
+
+    两列分开是为了让"文件大小"不和文件名挤在同一种颜色里 —— 一列深浅不一的
+    文字看着很乱, 分成两列后名称醒目、元信息退到背景里。
+    """
 
     file_activated = Signal(str)
     file_context_requested = Signal(str, object)
     directory_context_requested = Signal(str, object)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    META_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
+        self._theme = theme
         self.setHeaderHidden(True)
         self.setUniformRowHeights(True)
+        self.setColumnCount(2)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.itemDoubleClicked.connect(self._on_double_clicked)
         self.setIndentation(14)
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
 
     def load(self, root: TreeNode) -> None:
         self.clear()
@@ -63,6 +76,7 @@ class SpaceTree(QTreeWidget):
         root_item.setData(0, Qt.ItemDataRole.UserRole, ("dir", ""))
         self._fill(root_item, root)
         root_item.setExpanded(True)
+        self.apply_theme_colors()
 
     def _fill(self, parent: QTreeWidgetItem, node: TreeNode) -> None:
         for child in node.sorted_children():
@@ -73,17 +87,37 @@ class SpaceTree(QTreeWidget):
                 self._fill(item, child)
                 item.setExpanded(True)
             else:
-                language = get_language(child.language)
                 if child.binary:
                     mark = "已嵌入" if child.embedded else "未嵌入"
-                    item.setText(
-                        0, f"{child.name}   二进制 · {human_bytes(child.size)} · {mark}"
-                    )
+                    meta = f"二进制 · {human_bytes(child.size)} · {mark}"
                 else:
-                    item.setText(
-                        0, f"{child.name}   {language.name} · {human_bytes(child.size)}"
-                    )
+                    language = get_language(child.language)
+                    meta = f"{language.name} · {human_bytes(child.size)}"
+                item.setText(0, child.name)
+                item.setText(1, meta)
                 item.setData(0, Qt.ItemDataRole.UserRole, ("file", child.path))
+                item.setToolTip(0, f"{child.path}\n{meta}")
+
+    def apply_theme_colors(self) -> None:
+        """把第 1 列 (元信息) 统一淡化成次要色。"""
+        meta_color = QColor(self._theme.text_dim)
+        stack = [
+            self.topLevelItem(i) for i in range(self.topLevelItemCount())
+        ]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            if item.text(1):
+                item.setForeground(1, meta_color)
+                item.setTextAlignment(
+                    1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+            stack.extend(item.child(i) for i in range(item.childCount()))
+
+    def set_theme(self, theme: Theme) -> None:
+        self._theme = theme
+        self.apply_theme_colors()
 
     def _entry_at(self, item: Optional[QTreeWidgetItem]):
         if item is None:
@@ -128,6 +162,7 @@ class SpaceDetailPanel(QWidget):
     purge_requested = Signal(str)
     import_files_requested = Signal(str, str)      # (space_id, 目标目录)
     export_file_requested = Signal(str, str)       # (space_id, path)
+    remove_placeholder_requested = Signal(str, str)   # (space_id, 目录)
 
     def __init__(self, parent: Optional[QWidget] = None, *, theme: Theme = DEFAULT_THEME) -> None:
         super().__init__(parent)
@@ -331,7 +366,7 @@ class SpaceDetailPanel(QWidget):
         row.addWidget(collapse)
         layout.addWidget(bar)
 
-        self.tree = SpaceTree(panel)
+        self.tree = SpaceTree(panel, theme=self._theme)
         self.tree.file_activated.connect(
             lambda path: self._space and self.open_file_requested.emit(self._space.id, path)
         )
@@ -450,6 +485,13 @@ class SpaceDetailPanel(QWidget):
             lambda: self.import_files_requested.emit(self._space.id, path),
         )
         menu.addAction("新建目录…", lambda: self.add_directory_requested.emit(self._space.id))
+        placeholder = f"{path}/.gitkeep" if path else ".gitkeep"
+        if self._space.get_file(placeholder) is not None:
+            menu.addSeparator()
+            menu.addAction(
+                "删除 .gitkeep 占位文件…",
+                lambda: self.remove_placeholder_requested.emit(self._space.id, path),
+            )
         if path:
             menu.addSeparator()
             menu.addAction("删除目录", lambda: self.delete_file_requested.emit(self._space.id, path))
@@ -673,6 +715,7 @@ class SpaceDetailPanel(QWidget):
         self.binary_preview.set_theme(theme)
         self.language_bar.set_theme(theme)
         self.language_legend.set_theme(theme)
+        self.tree.set_theme(theme)
         for button in (
             self._edit_button,
             self._history_button,

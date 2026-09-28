@@ -15,6 +15,9 @@ from codemethod.core.spaces import (  # noqa: E402
     MAX_FILES_PER_SPACE,
     MAX_FILE_BYTES,
     MAX_SPACE_BINARY_BYTES,
+    DirectoryScan,
+    ImportOptions,
+    PlannedFile,
     ProjectFile,
     Space,
     build_tree,
@@ -26,6 +29,7 @@ from codemethod.core.spaces import (  # noqa: E402
     is_readme_path,
     looks_binary,
     normalize_project_path,
+    scan_external_directory,
     search_readmes,
 )
 
@@ -741,6 +745,242 @@ class TestExternalImport(unittest.TestCase):
         summary = self.repo.revisions(self.space.id)[0].summary
         self.assertIn("二进制内容变更", summary)
         self.assertIn(str(len(FAKE_PNG)), summary)
+
+
+class TestDirectoryPackaging(unittest.TestCase):
+    """把一整个目录连同子文件夹打包进空间 —— 先扫描出计划, 再照着计划执行。"""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.repo = Repository(name="pack")
+        self.space = self.repo.create_space("打包")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, rel: str, data: bytes) -> str:
+        target = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(data)
+        return target
+
+    def _project(self) -> None:
+        self._write("README.md", "# 项目\n中文说明\n".encode("utf-8"))
+        self._write("src/main.py", b"import os\n")
+        self._write("src/utils/helper.py", b"def helper():\n    return 1\n")
+        self._write("docs/GUIDE.md", "# 指南\n".encode("utf-8"))
+        self._write(".gitignore", b"*.pyc\n")
+        self._write(".git/objects/ab/cdef", b"\x00\x01")
+        self._write("__pycache__/main.pyc", b"\x00\x00")
+        self._write("node_modules/leftpad/index.js", b"module.exports=1\n")
+        self._write("assets/logo.png", FAKE_PNG)
+        self._write("build/output.bin", b"\x00" * 32)
+
+    # ---- 扫描 ----
+    def test_scan_keeps_structure_and_reports_everything(self):
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions())
+        paths = {f.path for f in scan.included}
+        self.assertIn("src/main.py", paths)
+        self.assertIn("src/utils/helper.py", paths)
+        self.assertIn("docs/GUIDE.md", paths)
+        self.assertIn("assets/logo.png", paths)
+        self.assertIn(".gitignore", paths)          # 隐藏文件默认保留
+
+    def test_scan_prunes_vcs_cache_and_build_dirs(self):
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions())
+        paths = {f.path for f in scan.included}
+        for gone in (".git/objects/ab/cdef", "__pycache__/main.pyc",
+                     "node_modules/leftpad/index.js", "build/output.bin"):
+            self.assertNotIn(gone, paths)
+        # 被剪掉的整个目录必须**显式记录下来**, 否则用户以为文件凭空消失
+        pruned = {path for path, _reason in scan.pruned_dirs}
+        self.assertIn(".git", pruned)
+        self.assertIn("__pycache__", pruned)
+        self.assertIn("node_modules", pruned)
+        self.assertIn("build", pruned)
+        self.assertTrue(scan.pruned_reasons())
+
+    def test_scan_options_can_include_everything(self):
+        self._project()
+        scan = scan_external_directory(
+            self.root,
+            ImportOptions(include_vcs=True, include_caches=True),
+        )
+        paths = {f.path for f in scan.included}
+        self.assertIn(".git/objects/ab/cdef", paths)
+        self.assertIn("node_modules/leftpad/index.js", paths)
+        self.assertEqual(scan.pruned_dirs, [])
+
+    def test_compiled_artifacts_are_always_skipped(self):
+        """``.pyc`` / ``.o`` 这类编译产物没有保留价值, 即使要求"含缓存目录"也不收。"""
+        self._project()
+        scan = scan_external_directory(
+            self.root,
+            ImportOptions(include_vcs=True, include_caches=True),
+        )
+        skipped = {f.path: f.reason for f in scan.skipped}
+        self.assertIn("__pycache__/main.pyc", skipped)
+        self.assertIn("缓存/临时文件", skipped["__pycache__/main.pyc"])
+
+    def test_scan_hidden_can_be_excluded(self):
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions(include_hidden=False))
+        paths = {f.path for f in scan.included}
+        self.assertNotIn(".gitignore", paths)
+        # 隐藏**文件**在文件级被跳过, 隐藏**目录**在目录级被剪掉
+        hidden_files = [f for f in scan.skipped if f.reason == "隐藏文件"]
+        self.assertTrue(hidden_files, scan.reasons())
+
+    def test_scan_without_recursion_can_flatten(self):
+        self._project()
+        scan = scan_external_directory(
+            self.root, ImportOptions(recursive=False, keep_structure=False)
+        )
+        self.assertEqual({f.path for f in scan.included}, {"README.md", ".gitignore"})
+
+    def test_big_text_is_embedded_as_bytes_instead_of_skipped(self):
+        """3 MB 的纯文本放不进编辑器, 但"完全打包"不该把它丢掉。"""
+        self._write("big.log", b"x" * (MAX_FILE_BYTES + 1024))
+        scan = scan_external_directory(self.root, ImportOptions())
+        item = next(f for f in scan.included if f.path == "big.log")
+        self.assertTrue(item.binary)
+
+    def test_file_over_binary_limit_is_reported(self):
+        self._write("huge.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
+        scan = scan_external_directory(self.root, ImportOptions())
+        skipped = [f for f in scan.skipped if f.path == "huge.bin"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("上限", skipped[0].reason)
+
+    def test_scan_missing_directory_reports_error(self):
+        scan = scan_external_directory(os.path.join(self.root, "nope"), ImportOptions())
+        self.assertTrue(scan.error)
+        self.assertEqual(scan.included, [])
+
+    def test_scan_target_dir_prefixes_everything(self):
+        self._project()
+        scan = scan_external_directory(
+            self.root, ImportOptions(target_dir="vendor/lib")
+        )
+        self.assertTrue(all(f.path.startswith("vendor/lib/") for f in scan.included))
+
+    def test_scan_does_not_read_whole_big_file(self):
+        """扫描只读每个文件的前 8 KB, 所以几千个文件也很快。"""
+        self._write("big.bin", b"\x00" * (2 * 1024 * 1024))
+        scan = scan_external_directory(self.root, ImportOptions())
+        self.assertEqual(scan.included[0].size, 2 * 1024 * 1024)
+
+    # ---- 执行 ----
+    def test_import_scan_matches_the_plan(self):
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions())
+        report = self.repo.import_scan(self.space.id, scan)
+        files = {f.path: f for f in self.repo.require_space(self.space.id).files}
+        self.assertEqual(set(files), {f.path for f in scan.included})
+        self.assertEqual(report.added, len(scan.included))
+        self.assertEqual(files["assets/logo.png"].raw_bytes(), FAKE_PNG)
+
+    def test_import_scan_is_one_revision(self):
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions())
+        before = self.repo.history.count(self.space.id)
+        self.repo.import_scan(self.space.id, scan)
+        self.assertEqual(self.repo.history.count(self.space.id), before + 1)
+        self.assertIn("打包导入", self.repo.revisions(self.space.id)[0].summary)
+
+    def test_import_scan_records_skipped_files(self):
+        self._write("ok.txt", b"1")
+        self._write("huge.bin", b"\x00" * (MAX_BINARY_BYTES + 16))
+        scan = scan_external_directory(self.root, ImportOptions())
+        report = self.repo.import_scan(self.space.id, scan)
+        self.assertEqual(report.added, 1)
+        self.assertEqual(len(report.skipped), 1)
+        self.assertIn("huge.bin", report.skipped[0][0])
+
+    def test_import_scan_refuses_to_blow_the_binary_budget(self):
+        from unittest import mock
+
+        import codemethod.core.spaces as spaces_mod
+
+        self._project()
+        scan = scan_external_directory(self.root, ImportOptions())
+        with mock.patch.object(spaces_mod, "MAX_SPACE_BINARY_BYTES", 10):
+            with self.assertRaises(RepositoryError) as ctx:
+                self.repo.import_scan(self.space.id, scan)
+            self.assertIn("只剩", str(ctx.exception))
+            report = self.repo.import_scan(self.space.id, scan, force=True)
+        self.assertGreater(report.added, 0)
+
+    def test_import_external_directory_uses_the_same_planner(self):
+        self._project()
+        report = self.repo.import_external_directory(self.space.id, self.root)
+        paths = {f.path for f in self.repo.require_space(self.space.id).files}
+        self.assertIn("src/main.py", paths)
+        self.assertNotIn("__pycache__/main.pyc", paths)
+        self.assertGreater(report.binary, 0)
+
+    def test_container_roundtrip_after_packaging(self):
+        self._project()
+        self.repo.import_external_directory(self.space.id, self.root)
+        restored = Repository.from_dict(self.repo.to_dict())
+        files = {f.path: f for f in restored.require_space(self.space.id).files}
+        self.assertEqual(files["assets/logo.png"].raw_bytes(), FAKE_PNG)
+        self.assertEqual(files["src/main.py"].content, "import os\n")
+
+    def test_undo_removes_the_whole_packaged_tree(self):
+        self._project()
+        self.repo.import_external_directory(self.space.id, self.root)
+        self.assertTrue(self.repo.can_undo(self.space.id))
+        self.repo.undo(self.space.id)
+        self.assertEqual(self.repo.require_space(self.space.id).files, [])
+        self.repo.redo(self.space.id)
+        self.assertGreater(len(self.repo.require_space(self.space.id).files), 1)
+
+
+class TestTagUsageAcrossKinds(unittest.TestCase):
+    """标签计数必须覆盖模块 / 空间 / 函数体三类实体。
+
+    早先只统计 ``self.entries``, 于是只给空间或函数体打过的标签永远显示 "0 次",
+    标签面板还会把它标成斜体 (表示"从未使用") —— 用户看起来就是统计坏了。
+    """
+
+    def setUp(self):
+        self.repo = Repository(name="tags")
+        self.module = self.repo.create_entry("模块", "d", "p", ["shared", "only-module"])
+        self.space = self.repo.create_space("空间", "d", "p", ["shared", "only-space"])
+        self.function = self.repo.create_function(
+            "fn", "python", "def fn():\n    return 1\n", tags=["shared", "only-fn"]
+        )
+
+    def test_usage_counts_all_three_kinds(self):
+        usage = self.repo.tag_usage()
+        self.assertEqual(usage["shared"], 3)
+        self.assertEqual(usage["only-module"], 1)
+        self.assertEqual(usage["only-space"], 1)
+        self.assertEqual(usage["only-fn"], 1)
+
+    def test_usage_ignores_deleted(self):
+        self.repo.delete_space(self.space.id)
+        self.assertEqual(self.repo.tag_usage()["shared"], 2)
+        self.assertNotIn("only-space", self.repo.tag_usage())
+
+    def test_usage_by_kind_breakdown(self):
+        detail = self.repo.tag_usage_by_kind()["shared"]
+        self.assertEqual(detail, {"module": 1, "space": 1, "function": 1})
+
+    def test_all_tags_sorted_by_real_usage(self):
+        self.assertEqual(self.repo.all_tags()[0], "shared")
+
+    def test_space_only_tag_is_not_reported_as_unused(self):
+        """这正是用户看到的 bug: 只给空间打过的标签显示 0 次 + 斜体。"""
+        usage = self.repo.tag_usage()
+        self.assertGreater(usage.get("only-space", 0), 0)
 
 
 if __name__ == "__main__":

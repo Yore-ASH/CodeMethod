@@ -57,6 +57,7 @@ class TagPanel(QWidget):
         super().__init__(parent)
         self._theme = theme
         self._colors: Dict[str, str] = {}
+        self._detail: Dict[str, Dict[str, int]] = {}
         self.setObjectName("SideBar")
 
         layout = QVBoxLayout(self)
@@ -120,9 +121,15 @@ class TagPanel(QWidget):
 
     # ---- 数据 ----
     def set_tags(
-        self, tags: List[str], usage: Optional[Dict[str, int]] = None, colors: Optional[Dict[str, str]] = None
+        self,
+        tags: List[str],
+        usage: Optional[Dict[str, int]] = None,
+        colors: Optional[Dict[str, str]] = None,
+        detail: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> None:
+        """``usage`` 是标签 → 使用次数; ``detail`` 是标签 → {类别: 次数} (用于提示)。"""
         usage = usage or {}
+        self._detail = {k.casefold(): v for k, v in (detail or {}).items()}
         self._colors = {k.casefold(): v for k, v in (colors or {}).items()}
         checked = {t.casefold() for t in self.selected_tags()}
 
@@ -143,13 +150,24 @@ class TagPanel(QWidget):
                 Qt.CheckState.Checked if key in checked else Qt.CheckState.Unchecked
             )
             if count == 0:
+                # 真正"从未使用"的标签才用斜体 (统计覆盖三类实体后, 这种情况很少见)
                 font = item.font()
                 font.setItalic(True)
                 item.setFont(font)
-            item.setToolTip(f"#{tag} — {count} 个条目\n右键可重命名/合并/删除")
+            item.setToolTip(self._tooltip(tag, count))
         self.list.blockSignals(False)
         self._apply_filter(self.filter_input.text())
         self._update_summary()
+
+    def _tooltip(self, tag: str, count: int) -> str:
+        lines = [f"#{tag} — {'从未使用' if not count else f'{count} 个对象'}" ]
+        breakdown = self._detail.get(tag.casefold()) or {}
+        labels = {"module": "模块", "space": "空间", "function": "函数体"}
+        parts = [f"{labels.get(k, k)} {v}" for k, v in sorted(breakdown.items()) if v]
+        if parts:
+            lines.append(" · ".join(parts))
+        lines.append("右键可重命名/合并/删除")
+        return "\n".join(lines)
 
     def selected_tags(self) -> List[str]:
         tags: List[str] = []

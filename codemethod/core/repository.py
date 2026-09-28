@@ -38,6 +38,8 @@ from .spaces import (
     MAX_FILES_PER_SPACE,
     MAX_FILE_BYTES,
     MAX_SPACE_BINARY_BYTES,
+    DirectoryScan,
+    ImportOptions,
     ProjectFile,
     Space,
     decode_text,
@@ -45,6 +47,7 @@ from .spaces import (
     is_binary_path,
     looks_binary,
     normalize_project_path,
+    scan_external_directory,
     search_readmes,
 )
 
@@ -595,24 +598,35 @@ class Repository:
         self._touch()
 
     def tag_usage(self) -> Dict[str, int]:
-        """返回 ``{规范标签名: 使用次数}``, 只统计未删除条目。"""
+        """返回 ``{规范标签键: 使用次数}``, 只统计未删除的对象。
+
+        注意: 必须覆盖**三类实体** (模块 / 空间 / 函数体)。早先这里只遍历
+        ``self.entries``, 于是只给空间或函数体打过的标签永远显示"0 次",
+        在标签面板里还会被标成斜体 (表示"从未使用") —— 看起来就像统计坏了。
+        """
         counts: Dict[str, int] = {}
-        for entry in self.entries.values():
-            if entry.deleted:
-                continue
-            for tag in entry.tags:
+        for item in self.items(include_deleted=False):
+            for tag in getattr(item, "tags", ()) or ():
                 key = tag_key(tag)
                 counts[key] = counts.get(key, 0) + 1
         return counts
 
+    def tag_usage_by_kind(self) -> Dict[str, Dict[str, int]]:
+        """``{标签键: {"module": n, "space": n, "function": n}}``, 供界面显示明细。"""
+        out: Dict[str, Dict[str, int]] = {}
+        for item in self.items(include_deleted=False):
+            kind = getattr(item, "kind", "module")
+            for tag in getattr(item, "tags", ()) or ():
+                bucket = out.setdefault(tag_key(tag), {})
+                bucket[kind] = bucket.get(kind, 0) + 1
+        return out
+
     def all_tags(self, *, include_unused: bool = True, include_deleted: bool = False) -> List[str]:
-        """所有标签名, 按使用次数降序、名称升序排列。"""
+        """所有标签名, 按使用次数降序、名称升序排列 (三类实体合并统计)。"""
         usage = self.tag_usage()
         names: Dict[str, str] = {}
-        for entry in self.entries.values():
-            if entry.deleted and not include_deleted:
-                continue
-            for tag in entry.tags:
+        for item in self.items(include_deleted=include_deleted):
+            for tag in getattr(item, "tags", ()) or ():
                 names.setdefault(tag_key(tag), tag)
         if include_unused:
             for key, info in self.tags.items():
@@ -1133,27 +1147,114 @@ class Repository:
         *,
         recursive: bool = True,
         target_dir: str = "",
+        options: Optional[ImportOptions] = None,
+        force: bool = False,
         author: Optional[str] = None,
     ) -> ImportReport:
-        """导入一个外部目录 (保留子目录结构)。"""
-        root = os.path.abspath(directory)
-        if not os.path.isdir(root):
-            raise RepositoryError(f"目录不存在: {directory}")
-        collected: List[str] = []
-        if recursive:
-            for current, dirs, files in os.walk(root):
-                dirs[:] = sorted(d for d in dirs if d not in (".git", "__pycache__", ".venv"))
-                for name in sorted(files):
-                    collected.append(os.path.join(current, name))
-        else:
-            collected = [
-                os.path.join(root, name)
-                for name in sorted(os.listdir(root))
-                if os.path.isfile(os.path.join(root, name))
-            ]
-        return self.import_external_files(
-            space_id, collected, base_dir=root, target_dir=target_dir, author=author
-        )
+        """把一整个外部目录 (含子目录) 打包进空间。
+
+        默认跳过版本控制目录 (``.git`` 等) 与缓存目录 (``__pycache__`` /
+        ``node_modules`` / ``.venv`` …) —— 想连这些一起打包就传 ``options``,
+        把 ``include_vcs`` / ``include_caches`` 打开。
+        """
+        opts = options or ImportOptions(recursive=recursive, target_dir=target_dir)
+        scan = scan_external_directory(directory, opts)
+        if scan.error:
+            raise RepositoryError(scan.error)
+        return self.import_scan(space_id, scan, force=force, author=author)
+
+    def import_scan(
+        self,
+        space_id: str,
+        scan: DirectoryScan,
+        *,
+        force: bool = False,
+        author: Optional[str] = None,
+    ) -> ImportReport:
+        """按一份已经算好的计划 (见 :func:`scan_external_directory`) 执行导入。
+
+        界面先用同一个扫描结果做预览, 用户确认后走这里, 因此**不会重复扫描**。
+        ``force=True`` 时允许超出空间的二进制软上限 (界面会在确认框里说清代价)。
+        """
+        space = self.require_space(space_id)
+        report = ImportReport()
+        planned = scan.included
+
+        total_binary = sum(item.size for item in planned if item.binary)
+        left = space.binary_budget_left()
+        if total_binary > left and not force:
+            raise RepositoryError(
+                f"这次要嵌入 {human_bytes(total_binary)} 的二进制内容, 但空间只剩 "
+                f"{human_bytes(left)} (单空间软上限 {human_bytes(MAX_SPACE_BINARY_BYTES)})。\n"
+                "可以少选一些文件, 或在导入对话框里勾上「仍然导入」。"
+            )
+
+        existing_paths = {item.path for item in space.files}
+        created: List[ProjectFile] = []
+        before = take_snapshot(space)
+
+        for item in planned:
+            if item.path not in existing_paths and len(space.files) + len(created) >= MAX_FILES_PER_SPACE:
+                report.skipped.append(
+                    (item.path, f"超过单空间 {MAX_FILES_PER_SPACE} 个文件的上限")
+                )
+                continue
+            try:
+                with open(item.source, "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                report.skipped.append((item.path, f"读取失败: {exc.strerror or exc}"))
+                continue
+
+            if item.binary:
+                file = ProjectFile(path=item.path, binary=True)
+                file.set_bytes(raw)
+            else:
+                body = decode_text(raw)
+                if body is None:
+                    # 扫描时按文本计划的, 真读进来却解不开 —— 退化为二进制嵌入,
+                    # 而不是把文件丢掉 (宁可多存也不丢内容)
+                    file = ProjectFile(path=item.path, binary=True)
+                    file.set_bytes(raw)
+                else:
+                    file = ProjectFile(path=item.path, content=body)
+
+            existing = space.get_file(item.path)
+            if existing is not None:
+                file.note = existing.note
+                report.updated += 1
+            else:
+                existing_paths.add(item.path)
+                report.added += 1
+            report.total_bytes += file.computed_size
+            if file.binary:
+                report.binary += 1
+            else:
+                report.text += 1
+            created.append(file)
+
+        for item in scan.skipped:
+            report.skipped.append((item.path, item.reason))
+
+        for file in created:
+            space.put_file(file)
+        if created:
+            detail = (
+                f"从 {os.path.basename(scan.root.rstrip(os.sep))}/ 打包导入 "
+                f"{len(created)} 个文件 ({report.summary()})"
+            )
+            if scan.skipped:
+                detail += f"; 跳过 {len(scan.skipped)} 个"
+            if force and total_binary > left:
+                detail += "（已超出空间软上限, 手动确认）"
+            self._space_file_change(space, "file_add", detail, author=author)
+        return report
+
+    def scan_directory(
+        self, directory: str, options: Optional[ImportOptions] = None
+    ) -> DirectoryScan:
+        """扫描一个待导入目录 (给界面做预览用, 不碰仓库)。"""
+        return scan_external_directory(directory, options)
 
     def export_space_file(
         self, space_id: str, path: str, target: str

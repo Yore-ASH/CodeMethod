@@ -19,7 +19,7 @@ from __future__ import annotations
 __all__ = ["__version__", "__app_name__", "APP_NAME", "APP_VERSION"]
 
 APP_NAME = "CodeMethod"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 __app_name__ = APP_NAME
 __version__ = APP_VERSION
